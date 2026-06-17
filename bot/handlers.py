@@ -74,7 +74,12 @@ async def onboarding_answer(message: Message, state: FSMContext):
         await message.answer(ONBOARDING_QUESTIONS[step + 1])
     else:
         await message.answer("⏳ Анализирую твои ответы и создаю профиль стиля...")
-        prompt = await finish_onboarding()
+        try:
+            prompt = await finish_onboarding()
+        except Exception as e:
+            await state.clear()
+            await message.answer(f"❌ Ошибка при создании профиля: {e}")
+            return
         await state.clear()
         await message.answer(
             f"✅ Готово! Вот твой профиль стиля:\n\n"

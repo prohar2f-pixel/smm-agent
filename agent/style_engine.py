@@ -3,11 +3,12 @@ from openai import AsyncOpenAI
 from agent.memory import get_all_voice, set_voice, get_setting, set_setting
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-opus-4-8")
+MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-3-5-sonnet-20241022")
 
 client = AsyncOpenAI(
     api_key=OPENROUTER_API_KEY,
     base_url="https://openrouter.ai/api/v1",
+    timeout=60.0,
 )
 
 ONBOARDING_QUESTIONS = [
