@@ -191,6 +191,19 @@ async def add_signal(source: str, source_type: str, summary: str, signal_type: s
         await db.commit()
 
 
+async def get_due_posts() -> list[dict]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT * FROM posts
+               WHERE status='postponed' AND scheduled_at IS NOT NULL
+               AND scheduled_at <= datetime('now')
+               ORDER BY scheduled_at"""
+        ) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+
 async def get_recent_signals(limit: int = 20) -> list[dict]:
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row

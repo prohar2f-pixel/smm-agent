@@ -4,6 +4,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from monitoring.rss_fetcher import fetch_rss
 from monitoring.telegram_monitor import monitor_telegram_competitors
+from monitoring.vk_monitor import monitor_vk_competitors
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,14 @@ def setup_scheduler(bot=None):
         monitor_telegram_competitors,
         CronTrigger(hour=8, minute=30),
         id="tg_monitor",
+        replace_existing=True,
+    )
+
+    # Ежедневно в 08:45 — мониторинг VK-конкурентов
+    scheduler.add_job(
+        monitor_vk_competitors,
+        CronTrigger(hour=8, minute=45),
+        id="vk_monitor",
         replace_existing=True,
     )
 
@@ -80,6 +89,39 @@ def setup_scheduler(bot=None):
             check_timeouts,
             CronTrigger(hour="*/12"),
             id="timeout_check",
+            replace_existing=True,
+        )
+
+        # Каждый час — публикация перенесённых постов у которых наступило время
+        async def auto_publish():
+            from agent.memory import get_due_posts, update_post_status
+            from publishing.telegram_pub import publish_to_telegram
+            from publishing.vk_pub import publish_to_vk
+
+            posts = await get_due_posts()
+            for post in posts:
+                try:
+                    tg_msg_id = await publish_to_telegram(bot, post["content_telegram"])
+                    vk_post_id = await publish_to_vk(post["content_vk"])
+                    await update_post_status(
+                        post["id"], "published",
+                        telegram_message_id=tg_msg_id,
+                        vk_post_id=vk_post_id,
+                    )
+                    await bot.send_message(
+                        chat_id=admin_id,
+                        text=f"✅ Пост #{post['id']} «{post['topic'][:40]}» опубликован автоматически.",
+                    )
+                except Exception as e:
+                    await bot.send_message(
+                        chat_id=admin_id,
+                        text=f"❌ Ошибка авто-публикации поста #{post['id']}: {e}",
+                    )
+
+        scheduler.add_job(
+            auto_publish,
+            CronTrigger(minute=0),
+            id="auto_publish",
             replace_existing=True,
         )
 

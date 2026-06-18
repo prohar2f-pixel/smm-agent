@@ -5,15 +5,9 @@ from agent.memory import add_signal, get_setting_json
 VK_TOKEN = os.getenv("VK_TOKEN")
 
 
-def monitor_vk_competitors():
-    competitors = None
-
-    import asyncio
-    loop = asyncio.new_event_loop()
-    competitors = loop.run_until_complete(get_setting_json("vk_competitors", []))
-    loop.close()
-
-    if not competitors:
+async def monitor_vk_competitors():
+    competitors = await get_setting_json("vk_competitors", [])
+    if not competitors or not VK_TOKEN:
         return
 
     session = vk_api.VkApi(token=VK_TOKEN)
@@ -26,16 +20,11 @@ def monitor_vk_competitors():
                 text = post.get("text", "").strip()
                 if len(text) > 50:
                     summary = text[:200].replace("\n", " ")
-
-                    async def _save():
-                        await add_signal(
-                            source=str(group_id),
-                            source_type="vk",
-                            summary=summary,
-                            signal_type="topic",
-                        )
-
-                    import asyncio
-                    asyncio.get_event_loop().run_until_complete(_save())
+                    await add_signal(
+                        source=str(group_id),
+                        source_type="vk",
+                        summary=summary,
+                        signal_type="topic",
+                    )
         except Exception:
             pass

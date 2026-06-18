@@ -7,6 +7,7 @@ load_dotenv()
 
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import BotCommand
 
 from agent.memory import init_db
 from bot.handlers import router
@@ -30,6 +31,18 @@ async def main():
     dp.message.middleware(AdminOnly())
     dp.callback_query.middleware(AdminOnly())
     dp.include_router(router)
+
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Начать / повторный онбординг"),
+        BotCommand(command="plan", description="Сгенерировать план на неделю"),
+        BotCommand(command="queue", description="Посты на согласование"),
+        BotCommand(command="voice", description="Мой профиль стиля"),
+        BotCommand(command="competitors", description="Список конкурентов"),
+        BotCommand(command="add_tg", description="Добавить TG-канал конкурента"),
+        BotCommand(command="add_vk", description="Добавить VK-группу конкурента"),
+        BotCommand(command="dzen", description="Текст для Дзена"),
+        BotCommand(command="instagram", description="Текст для Instagram"),
+    ])
 
     scheduler = setup_scheduler(bot)
     scheduler.start()
