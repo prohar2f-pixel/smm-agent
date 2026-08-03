@@ -14,7 +14,7 @@
 - The primary audience is owners of service businesses and experts who sell services.
 - The only primary CTA is: «Пришлите задачу — бесплатно подскажу, что вам действительно нужно: сайт, бот или автоматизация».
 - The package contains no video, Reels, Shorts, clips, publishing dates, mandatory frequency, or automatic posting.
-- Every factual claim must be traceable to the project: 16 WebP frames, reversible scroll behavior, mobile adaptation, reduced-motion fallback, capped DPR, nearest-loaded-frame fallback, and 11/11 passing tests.
+- Every factual claim must be traceable to the project at SHA `cffd1ec`: 16 WebP frames, reversible scroll behavior, mobile adaptation, reduced-motion fallback, capped DPR, nearest-loaded-frame fallback, and 12/12 passing tests.
 - Do not expose secrets, private logs, personal data, environment variables, or unapproved third-party watch images.
 - Do not call `publishing/`, `scheduler.py`, platform APIs, or bot publication commands.
 - Instagram, Telegram, and VK must receive native copy, not the same text pasted three times.
@@ -67,7 +67,7 @@ node tests.mjs
 find assets/disassembly -maxdepth 1 -type f -name 'frame-*.webp' | wc -l
 ```
 
-Expected: TAP reports `pass 11`, `fail 0`; the frame count is `16`.
+Expected: from a clean checkout of SHA `cffd1ec`, TAP reports `pass 12`, `fail 0`; the frame count is `16`.
 
 - [ ] **Step 3: Copy only first-party project evidence**
 
@@ -112,7 +112,7 @@ Run:
 
 ```bash
 test "$(find /home/agent/workspace/output/nereide-content-pilot/source -maxdepth 1 -type f | wc -l)" -eq 7
-rg -n "16 WebP|11/11|демонстрационный проект|персональ|секрет" docs/content-strategy/nereide-source-manifest.md
+rg -n "16 WebP|12/12|cffd1ec|демонстрационный проект|персональ|секрет" docs/content-strategy/nereide-source-manifest.md
 git diff --check
 ```
 
@@ -147,7 +147,7 @@ Start the file with these fields and resolved values:
 - Аудитория: владельцы сервисного бизнеса и эксперты, продающие услуги.
 - Серия: «С телефона в прод».
 - Мастер-идея: путь от идеи до работающего и проверенного демонстрационного сайта.
-- Доказательство: рабочий NERÉIDE, 16 кадров, мобильная адаптация и 11/11 тестов.
+- Доказательство: рабочий NERÉIDE, 16 кадров, мобильная адаптация и 12/12 тестов на SHA `cffd1ec`.
 - CTA: «Пришлите задачу — бесплатно подскажу, что вам действительно нужно: сайт, бот или автоматизация».
 ```
 
@@ -163,7 +163,7 @@ Use the Demo Walkthrough structure with exactly these slide jobs:
 05 — 16-frame reversible disassembly
 06 — mobile and accessibility decisions
 07 — what AI accelerated and what required human judgment
-08 — 11/11 checks and honest limitations
+08 — 12/12 checks and honest limitations
 09 — positioning conclusion and the single CTA
 ```
 
@@ -176,7 +176,7 @@ Use this sequence:
 ```text
 01 — hook: the site was managed from a phone
 02 — tension: a beautiful AI image is not a finished site
-03 — proof: 16 frames, mobile adaptation, 11/11 checks
+03 — proof: 16 frames, mobile adaptation, 12/12 checks
 04 — one question sticker prompt leading to the same CTA
 ```
 
@@ -199,7 +199,7 @@ Write 250–400 Russian words as a self-contained case. Open with the business m
 Run:
 
 ```bash
-rg -n "NERÉIDE|демонстрацион|16|11/11|Пришлите задачу" docs/content-strategy/nereide-content-package.md
+rg -n "NERÉIDE|демонстрацион|16|12/12|Пришлите задачу" docs/content-strategy/nereide-content-package.md
 if rg -ni "клиентский кейс|бренд заказчика|продажи выросли|конверсия выросла|гарантир|успешный успех|революцион" docs/content-strategy/nereide-content-package.md; then exit 1; fi
 git diff --check
 ```
@@ -400,7 +400,7 @@ Confirm every required deliverable exists: strategic card, nine-slide carousel, 
 Run:
 
 ```bash
-rg -n "демонстрацион|16|11/11|Пришлите задачу" docs/content-strategy/nereide-{pilot,source-manifest,content-package}.md
+rg -n "демонстрацион|16|12/12|cffd1ec|Пришлите задачу" docs/content-strategy/nereide-{pilot,source-manifest,content-package}.md
 if rg -ni "клиентский кейс|бренд заказчика|продажи выросли|конверсия выросла|автоматически опублик" docs/content-strategy/nereide-{pilot,source-manifest,content-package}.md; then exit 1; fi
 git status --short --branch
 ```
