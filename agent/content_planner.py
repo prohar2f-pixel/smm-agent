@@ -1,14 +1,11 @@
 import os
-from openai import AsyncOpenAI
 from agent.memory import get_recent_topics, get_recent_signals
 from agent.style_engine import get_brand_voice_prompt
+from openrouter_client import create_async_openai
 
 MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-opus-4-8")
 
-client = AsyncOpenAI(
-    api_key=os.getenv("OPENROUTER_API_KEY"),
-    base_url="https://openrouter.ai/api/v1",
-)
+client = create_async_openai()
 
 WEEK_STRUCTURE = """
 Структура недели (5 постов):

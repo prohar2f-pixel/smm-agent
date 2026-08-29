@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 from dotenv import load_dotenv
+from safe_logging import configure_safe_logging
 
 load_dotenv()
 
@@ -14,10 +15,7 @@ from bot.handlers import router
 from bot.middlewares import AdminOnly
 from scheduler import setup_scheduler
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+configure_safe_logging()
 logger = logging.getLogger(__name__)
 
 
