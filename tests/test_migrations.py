@@ -102,5 +102,107 @@ class MigrationRunnerTests(unittest.TestCase):
             discover_migrations(self.migrations_dir)
 
 
+class LegacyBootstrapTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "agent.db"
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_empty_database_gains_legacy_schema_and_version_one(self):
+        applied = run_migrations(self.db_path)
+
+        with sqlite3.connect(self.db_path) as connection:
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            versions = connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ).fetchall()
+
+        self.assertEqual(applied, [1])
+        self.assertTrue(
+            {
+                "brand_voice",
+                "posts",
+                "topics_used",
+                "competitor_signals",
+                "settings",
+            }.issubset(tables)
+        )
+        self.assertEqual(versions, [(1,)])
+
+    def test_existing_legacy_post_survives_schema_adoption_unchanged(self):
+        original = (
+            41,
+            "Демонстрация проекта",
+            "case",
+            "Текст Telegram",
+            "Текст VK",
+            "published",
+            "2026-10-12T09:00:00+00:00",
+            "2026-10-12T09:05:00+00:00",
+            7001,
+            9001,
+            "good",
+            "2026-10-12 08:00:00",
+        )
+        with sqlite3.connect(self.db_path) as connection:
+            connection.executescript(
+                """
+                CREATE TABLE posts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    topic TEXT,
+                    post_type TEXT,
+                    content_telegram TEXT,
+                    content_vk TEXT,
+                    status TEXT DEFAULT 'draft',
+                    scheduled_at DATETIME,
+                    published_at DATETIME,
+                    telegram_message_id INTEGER,
+                    vk_post_id INTEGER,
+                    reaction TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                );
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO posts(
+                    id, topic, post_type, content_telegram, content_vk, status,
+                    scheduled_at, published_at, telegram_message_id, vk_post_id,
+                    reaction, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                original,
+            )
+            connection.commit()
+
+        applied = run_migrations(self.db_path)
+
+        with sqlite3.connect(self.db_path) as connection:
+            saved = connection.execute(
+                """
+                SELECT id, topic, post_type, content_telegram, content_vk, status,
+                       scheduled_at, published_at, telegram_message_id, vk_post_id,
+                       reaction, created_at
+                FROM posts WHERE id = 41
+                """
+            ).fetchone()
+            post_count = connection.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
+            settings_count = connection.execute(
+                "SELECT COUNT(*) FROM settings"
+            ).fetchone()[0]
+
+        self.assertEqual(applied, [1])
+        self.assertEqual(saved, original)
+        self.assertEqual(post_count, 1)
+        self.assertEqual(settings_count, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
