@@ -79,6 +79,18 @@ smm-agent/
   brand_voice | posts | topics_used | competitor_signals | settings
 ```
 
+### R0 transactional foundation
+
+The `feat/content-factory-r0` branch adds infrastructure without changing bot commands or publication behavior:
+
+- `db/migrate.py` discovers ordered SQL migrations, verifies SHA-256 checksums and applies each version atomically;
+- `db/migrations/001_legacy_baseline.sql` preserves the existing schema;
+- `db/migrations/002_r0_control_plane.sql` adds disabled feature flags, inbox/outbox, audit and callback action tables;
+- `db/backup.py` creates a new SQLite backup, refuses overwrite and verifies integrity and migration history;
+- `docs/runbooks/database-safety.md` defines safe migration, restore and rollback steps.
+
+`agent.memory.init_db()` now runs migrations in `asyncio.to_thread`. New functionality stays disabled until a later release explicitly uses its feature flag. R0 does not migrate a production database automatically outside normal application startup and does not alter Telegram, VK or OpenRouter operations.
+
 ---
 
 ## 5. Ключевые решения
@@ -94,6 +106,13 @@ smm-agent/
 ---
 
 ## 6. Тестирование
+
+Автоматическая проверка R0:
+
+```bash
+python3 -m py_compile db/migrate.py db/backup.py agent/memory.py
+python3 -m unittest discover -v
+```
 
 **Где тестировать:** локально через `python main.py` с тестовым ботом (@тест-бот из BotFather).
 
@@ -123,6 +142,8 @@ smm-agent/
 | `.env.example` | Шаблон переменных без значений | При добавлении новой env-переменной |
 | `data/agent.db` | Вся память агента | Обновляется автоматически |
 | `agent/style_engine.py` | Логика онбординга и brand_voice | При изменении вопросов онбординга |
+| `db/migrations/` | Неизменяемая история схемы SQLite | Только новой additive migration |
+| `docs/runbooks/database-safety.md` | Backup, migration, restore и rollback | При изменении DB workflow |
 
 ---
 
