@@ -124,7 +124,7 @@ class LegacyBootstrapTests(unittest.TestCase):
                 "SELECT version FROM schema_migrations ORDER BY version"
             ).fetchall()
 
-        self.assertEqual(applied, [1])
+        self.assertEqual(applied[0], 1)
         self.assertTrue(
             {
                 "brand_voice",
@@ -134,7 +134,7 @@ class LegacyBootstrapTests(unittest.TestCase):
                 "settings",
             }.issubset(tables)
         )
-        self.assertEqual(versions, [(1,)])
+        self.assertEqual(versions[0], (1,))
 
     def test_existing_legacy_post_survives_schema_adoption_unchanged(self):
         original = (
@@ -198,10 +198,227 @@ class LegacyBootstrapTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM settings"
             ).fetchone()[0]
 
-        self.assertEqual(applied, [1])
+        self.assertEqual(applied[0], 1)
         self.assertEqual(saved, original)
         self.assertEqual(post_count, 1)
         self.assertEqual(settings_count, 0)
+
+
+class R0ControlPlaneTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.temp_dir.name) / "agent.db"
+        run_migrations(self.db_path)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def test_feature_flag_defaults_disabled_and_key_is_unique(self):
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                "INSERT INTO feature_flags(key, updated_by) VALUES (?, ?)",
+                ("content_factory_r0", "test-owner"),
+            )
+            enabled, row_version = connection.execute(
+                "SELECT enabled, row_version FROM feature_flags WHERE key = ?",
+                ("content_factory_r0",),
+            ).fetchone()
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO feature_flags(key, updated_by) VALUES (?, ?)",
+                    ("content_factory_r0", "second-owner"),
+                )
+
+        self.assertEqual(enabled, 0)
+        self.assertEqual(row_version, 1)
+
+    def test_inbox_rejects_duplicate_producer_event(self):
+        values = (
+            "inbox-1",
+            "telegram:bot-1",
+            "update-77",
+            "a" * 64,
+            "2026-10-12T12:00:00+00:00",
+        )
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO inbox_events(
+                    id, producer, event_id, payload_sha256, received_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO inbox_events(
+                        id, producer, event_id, payload_sha256, received_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    ("inbox-2", *values[1:]),
+                )
+
+    def test_outbox_enforces_status_and_has_pending_delivery_index(self):
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO outbox_events(
+                    id, event_type, aggregate_id, payload_json,
+                    available_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "outbox-1",
+                    "content.created",
+                    "project-1",
+                    "{}",
+                    "2026-10-12T12:00:00+00:00",
+                    "2026-10-12T12:00:00+00:00",
+                    "2026-10-12T12:00:00+00:00",
+                ),
+            )
+            status = connection.execute(
+                "SELECT status FROM outbox_events WHERE id = 'outbox-1'"
+            ).fetchone()[0]
+            indexes = {
+                row[1] for row in connection.execute("PRAGMA index_list(outbox_events)")
+            }
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "UPDATE outbox_events SET status = 'sent_again' WHERE id = 'outbox-1'"
+                )
+
+        self.assertEqual(status, "pending")
+        self.assertIn("idx_outbox_pending", indexes)
+
+    def test_callback_token_is_unique_versioned_and_consumed_once(self):
+        values = (
+            "opaque-token",
+            "1001",
+            "2002",
+            "approve",
+            "revision-1",
+            1,
+            "b" * 64,
+            "2026-10-12T12:05:00+00:00",
+            "2026-10-12T12:00:00+00:00",
+        )
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO callback_actions(
+                    token, user_id, chat_id, action, subject_id,
+                    expected_row_version, subject_sha256, expires_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO callback_actions(
+                        token, user_id, chat_id, action, subject_id,
+                        expected_row_version, subject_sha256, expires_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    values,
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO callback_actions(
+                        token, user_id, chat_id, action, subject_id,
+                        expected_row_version, subject_sha256, expires_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("bad-version", *values[1:5], 0, *values[6:]),
+                )
+
+            first = connection.execute(
+                """
+                UPDATE callback_actions
+                SET consumed_at = ?, result_ref = ?
+                WHERE token = ? AND consumed_at IS NULL
+                """,
+                ("2026-10-12T12:01:00+00:00", "review-7", "opaque-token"),
+            ).rowcount
+            second = connection.execute(
+                """
+                UPDATE callback_actions
+                SET consumed_at = ?, result_ref = ?
+                WHERE token = ? AND consumed_at IS NULL
+                """,
+                ("2026-10-12T12:02:00+00:00", "review-8", "opaque-token"),
+            ).rowcount
+
+        self.assertEqual(first, 1)
+        self.assertEqual(second, 0)
+
+    def test_audit_event_captures_actor_action_aggregate_and_correlation(self):
+        with sqlite3.connect(self.db_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO audit_events(
+                    id, actor_id, actor_role, command_id, aggregate_type,
+                    aggregate_id, action, before_status, after_status,
+                    row_version, reason, correlation_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "audit-1",
+                    "1001",
+                    "owner",
+                    "command-1",
+                    "pilot",
+                    "pilot-1",
+                    "start",
+                    "ready",
+                    "running",
+                    2,
+                    "owner approved",
+                    "correlation-1",
+                    "2026-10-12T12:00:00+00:00",
+                ),
+            )
+            saved = connection.execute(
+                """
+                SELECT actor_id, action, aggregate_type, aggregate_id,
+                       correlation_id, row_version
+                FROM audit_events WHERE id = 'audit-1'
+                """
+            ).fetchone()
+
+        self.assertEqual(
+            saved,
+            ("1001", "start", "pilot", "pilot-1", "correlation-1", 2),
+        )
+
+    def test_failed_migration_rolls_back_schema_and_version_record(self):
+        migration_dir = Path(self.temp_dir.name) / "broken_migrations"
+        migration_dir.mkdir()
+        (migration_dir / "001_stable.sql").write_text(
+            "CREATE TABLE stable_table (id INTEGER);\n", encoding="utf-8"
+        )
+        (migration_dir / "002_broken.sql").write_text(
+            "CREATE TABLE partial_table (id INTEGER);\nTHIS IS NOT SQL;\n",
+            encoding="utf-8",
+        )
+        broken_db = Path(self.temp_dir.name) / "broken.db"
+
+        with self.assertRaisesRegex(MigrationError, "002_broken"):
+            run_migrations(broken_db, migration_dir)
+
+        with sqlite3.connect(broken_db) as connection:
+            versions = connection.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ).fetchall()
+            partial_exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='partial_table'"
+            ).fetchone()
+
+        self.assertEqual(versions, [(1,)])
+        self.assertIsNone(partial_exists)
 
 
 if __name__ == "__main__":
