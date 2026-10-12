@@ -1,8 +1,10 @@
 import hashlib
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from db.migrate import MigrationError, discover_migrations, run_migrations
 
@@ -100,6 +102,68 @@ class MigrationRunnerTests(unittest.TestCase):
 
         with self.assertRaisesRegex(MigrationError, "Malformed migration filename"):
             discover_migrations(self.migrations_dir)
+
+    def test_migration_cannot_commit_partial_schema_before_failure(self):
+        self.write_migration(
+            "001_escape.sql",
+            """
+            CREATE TABLE leaked_before_commit (id INTEGER);
+            COMMIT;
+            THIS IS NOT SQL;
+            """,
+        )
+
+        with self.assertRaises(MigrationError):
+            run_migrations(self.db_path, self.migrations_dir)
+
+        with sqlite3.connect(self.db_path) as connection:
+            leaked = connection.execute(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name='leaked_before_commit'
+                """
+            ).fetchone()
+            versions = connection.execute(
+                "SELECT version FROM schema_migrations"
+            ).fetchall()
+
+        self.assertIsNone(leaked)
+        self.assertEqual(versions, [])
+
+    def test_concurrent_startup_serializes_history_check_and_application(self):
+        self.write_migration(
+            "001_first.sql", "CREATE TABLE first_table (id INTEGER);\n"
+        )
+        barrier = threading.Barrier(2)
+        original_apply = __import__(
+            "db.migrate", fromlist=["_apply_migration"]
+        )._apply_migration
+        results = []
+        errors = []
+
+        def synchronized_apply(connection, record):
+            try:
+                barrier.wait(timeout=1)
+            except threading.BrokenBarrierError:
+                pass
+            return original_apply(connection, record)
+
+        def migrate():
+            try:
+                results.append(run_migrations(self.db_path, self.migrations_dir))
+            except Exception as exc:
+                errors.append(exc)
+
+        with patch("db.migrate._apply_migration", synchronized_apply):
+            workers = [threading.Thread(target=migrate) for _ in range(2)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=10)
+
+        self.assertFalse(any(worker.is_alive() for worker in workers))
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(results), [[], [1]])
 
 
 class LegacyBootstrapTests(unittest.TestCase):

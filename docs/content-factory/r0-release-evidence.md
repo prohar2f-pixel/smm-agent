@@ -26,8 +26,8 @@ git diff --check
 Observed result before the documentation commit:
 
 - Python compilation exited with code 0;
-- 22 tests ran;
-- 22 tests passed;
+- 24 tests ran after the independent review fix pass;
+- 24 tests passed;
 - 0 failures and 0 errors;
 - `git diff --check` exited with code 0.
 
@@ -35,6 +35,8 @@ Covered behaviors:
 
 - ordered migration discovery and exact-byte SHA-256 checksums;
 - one-time application and repeatable startup;
+- serialized concurrent startup with a history recheck under the write lock;
+- rejection of migration-owned transaction control that could escape rollback;
 - rejection of malformed, duplicate, missing or changed applied migrations;
 - atomic rollback after invalid SQL;
 - empty and populated legacy database adoption without deleting the tested post;
@@ -67,5 +69,14 @@ The new control-plane tables are infrastructure only. No handler currently write
 - concurrent processes competing for the same production SQLite file;
 - R1 domain tables, budget reservations, jobs, workers or safe publishing;
 - render and video pipelines.
+
+## Independent review fix pass
+
+The reviewer reproduced two blocking migration-runner defects before merge:
+
+1. a migration containing `COMMIT` could preserve earlier DDL after a later SQL failure;
+2. two concurrent initializers could use the same stale migration-history snapshot and fail one startup.
+
+Both cases received regression tests that failed against commit `84eba34` and passed after the fix. The runner now rejects migration transaction control through the SQLite authorizer, executes complete statements inside runner-owned transactions and rechecks history under `BEGIN IMMEDIATE` before each migration. The full suite passed twice with 24/24 tests.
 
 These items require their own controlled package. The next development slice is R1 Source, Brief and Evidence after review of this isolated branch.

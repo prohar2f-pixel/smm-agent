@@ -110,8 +110,29 @@ def _apply_migration(
             f"Migration must be UTF-8: {record.path.name}"
         ) from exc
 
+    def reject_transaction_control(
+        action_code: int,
+        _arg1: str | None,
+        _arg2: str | None,
+        _database: str | None,
+        _trigger: str | None,
+    ) -> int:
+        if action_code in (sqlite3.SQLITE_TRANSACTION, sqlite3.SQLITE_SAVEPOINT):
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
     try:
-        connection.executescript("BEGIN IMMEDIATE;\n" + sql)
+        connection.set_authorizer(reject_transaction_control)
+        for statement in _iter_sql_statements(sql):
+            connection.execute(statement)
+    except sqlite3.Error as exc:
+        raise MigrationError(
+            f"Migration {record.version:03d}_{record.name} failed: {exc}"
+        ) from exc
+    finally:
+        connection.set_authorizer(None)
+
+    try:
         connection.execute(
             """
             INSERT INTO schema_migrations(version, name, checksum, applied_at)
@@ -124,12 +145,28 @@ def _apply_migration(
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
-        connection.commit()
     except sqlite3.Error as exc:
-        connection.rollback()
         raise MigrationError(
             f"Migration {record.version:03d}_{record.name} failed: {exc}"
         ) from exc
+
+
+def _iter_sql_statements(sql: str):
+    """Yield complete SQLite statements without losing trigger or string syntax."""
+    buffer: list[str] = []
+    for character in sql:
+        buffer.append(character)
+        if character != ";":
+            continue
+        candidate = "".join(buffer)
+        if sqlite3.complete_statement(candidate):
+            if candidate.strip():
+                yield candidate
+            buffer.clear()
+
+    remainder = "".join(buffer)
+    if remainder.strip():
+        yield remainder
 
 
 def run_migrations(
@@ -146,13 +183,23 @@ def run_migrations(
     try:
         _configure_connection(connection)
         _ensure_migration_table(connection)
-        applied = _validate_applied(connection, records)
         newly_applied: list[int] = []
-        for record in records:
-            if record.version in applied:
-                continue
-            _apply_migration(connection, record)
-            newly_applied.append(record.version)
-        return newly_applied
+        while True:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                applied = _validate_applied(connection, records)
+                pending = next(
+                    (record for record in records if record.version not in applied),
+                    None,
+                )
+                if pending is None:
+                    connection.commit()
+                    return newly_applied
+                _apply_migration(connection, pending)
+                connection.commit()
+                newly_applied.append(pending.version)
+            except Exception:
+                connection.rollback()
+                raise
     finally:
         connection.close()
