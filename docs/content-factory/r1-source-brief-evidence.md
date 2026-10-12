@@ -32,6 +32,7 @@ The readiness gate returns sorted unique codes:
 - `CROSS_PILOT_EVIDENCE`
 
 An approved review is valid only when its `subject_sha256` equals the immutable hash of the requested revision. Parent approvals never transfer to child revisions.
+Only the latest script-review decision is authoritative. Approval also requires a reviewer role, decision actor/time and checklist version.
 
 ## Safety properties covered by tests
 
@@ -42,14 +43,20 @@ An approved review is valid only when its `subject_sha256` equals the immutable 
 - Cross-pilot sources and evidence are rejected.
 - Project, brief and revision numbering conflicts fail closed.
 - Supported claims need evidence.
+- Supported claims need a reviewer check and cannot outlive `valid_until`.
+- Evidence must use a rights-allowed, privacy-clear project source and an excerpt or addressed asset range.
 - Hypotheses need a visible label location.
 - Disputed, outdated and unverified claims block production.
 - Revoked project sources are detected again at readiness time.
 - Script approval is bound to the exact revision hash.
+- Mutable project pointers use compare-and-swap and revision ancestry is consecutive.
+- Migration 004 rejects cross-scope links even if a caller bypasses the service layer.
 
 ## Disabled posture
 
 R1 is code and schema only. It is not connected to bot commands, callbacks, scheduler jobs, render workers, publication adapters or the production database. Existing posting behavior is unchanged. Activation requires a later integration package with feature flags, operator UX and deployment approval.
+
+`ReadinessResult` is an atomic database snapshot, not a durable production authorization token. A future render or publish job must run the same guards and create its job within one transaction so a later rights revocation cannot race the authorization boundary.
 
 ## Verification
 
@@ -61,4 +68,4 @@ python3 -m unittest discover -v
 git diff --check
 ```
 
-The implementation was developed on `feat/content-factory-r0` starting after commit `56352bfe386687d1d7a18ab9f38140077b995572`. It was not merged, pushed or deployed as part of R1 development.
+The implementation was developed on `feat/content-factory-r0` starting after commit `56352bfe386687d1d7a18ab9f38140077b995572`. The reviewed code head is `e9649ed`; 55 tests passed after the review fixes. It was not merged, pushed or deployed as part of R1 development.

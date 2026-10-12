@@ -98,7 +98,8 @@ R1 adds an isolated domain layer on the same feature branch:
 - `domain/source_service.py` captures sources and verifies rights/privacy with compare-and-swap protection;
 - `domain/content_service.py` creates projects plus immutable brief and revision versions with canonical SHA-256 hashes;
 - `domain/readiness_service.py` stores claims, evidence and reviews, then evaluates the exact revision before production;
-- `db/migrations/003_r1_content_core.sql` adds normalized provenance and content tables.
+- `db/migrations/003_r1_content_core.sql` adds normalized provenance and content tables;
+- `db/migrations/004_r1_scope_guards.sql` adds checklist versioning plus database-level pilot, project, asset, evidence and revision-lineage guards.
 
 These APIs are not connected to Telegram handlers, scheduler jobs, publication adapters or production startup flows. No R1 feature is enabled in production.
 
