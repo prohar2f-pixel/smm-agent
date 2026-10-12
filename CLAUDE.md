@@ -91,6 +91,17 @@ The `feat/content-factory-r0` branch adds infrastructure without changing bot co
 
 `agent.memory.init_db()` now runs migrations in `asyncio.to_thread`. New functionality stays disabled until a later release explicitly uses its feature flag. R0 does not migrate a production database automatically outside normal application startup and does not alter Telegram, VK or OpenRouter operations.
 
+### R1 source, brief and evidence core
+
+R1 adds an isolated domain layer on the same feature branch:
+
+- `domain/source_service.py` captures sources and verifies rights/privacy with compare-and-swap protection;
+- `domain/content_service.py` creates projects plus immutable brief and revision versions with canonical SHA-256 hashes;
+- `domain/readiness_service.py` stores claims, evidence and reviews, then evaluates the exact revision before production;
+- `db/migrations/003_r1_content_core.sql` adds normalized provenance and content tables.
+
+These APIs are not connected to Telegram handlers, scheduler jobs, publication adapters or production startup flows. No R1 feature is enabled in production.
+
 ---
 
 ## 5. Ключевые решения
@@ -111,6 +122,13 @@ The `feat/content-factory-r0` branch adds infrastructure without changing bot co
 
 ```bash
 python3 -m py_compile db/migrate.py db/backup.py agent/memory.py
+python3 -m unittest discover -v
+```
+
+R1 domain verification:
+
+```bash
+python3 -m py_compile db/content_repository.py domain/source_service.py domain/content_service.py domain/readiness_service.py
 python3 -m unittest discover -v
 ```
 
@@ -144,6 +162,7 @@ python3 -m unittest discover -v
 | `agent/style_engine.py` | Логика онбординга и brand_voice | При изменении вопросов онбординга |
 | `db/migrations/` | Неизменяемая история схемы SQLite | Только новой additive migration |
 | `docs/runbooks/database-safety.md` | Backup, migration, restore и rollback | При изменении DB workflow |
+| `docs/content-factory/r1-source-brief-evidence.md` | Границы и проверки R1 domain core | При изменении Source/Brief/Evidence workflow |
 
 ---
 
