@@ -48,7 +48,7 @@ class ContentServiceTests(unittest.TestCase):
         return self.service.create_brief(
             "brief-1", "project-1", 1, "founders", "leads", "audit", "proof",
             "Write us", "telegram", "channel", 30, 45, [], "brief-v1",
-            ["source-1"], "owner", NOW,
+            ["source-1"], "owner", NOW, 1,
         )
 
     def test_hash_is_canonical(self):
@@ -63,28 +63,38 @@ class ContentServiceTests(unittest.TestCase):
     def test_brief_requires_project_source_and_nonempty_cta(self):
         self.project()
         with self.assertRaises(ValidationError):
-            self.service.create_brief("b", "project-1", 1, "a", "g", "o", "x", "", "tg", "c", 30, 45, [], "v", ["source-1"], "u", NOW)
+            self.service.create_brief("b", "project-1", 1, "a", "g", "o", "x", "", "tg", "c", 30, 45, [], "v", ["source-1"], "u", NOW, 1)
         with self.assertRaises(ValidationError):
-            self.service.create_brief("b", "project-1", 1, "a", "g", "o", "x", "cta", "tg", "c", 30, 45, [], "v", ["source-2"], "u", NOW)
+            self.service.create_brief("b", "project-1", 1, "a", "g", "o", "x", "cta", "tg", "c", 30, 45, [], "v", ["source-2"], "u", NOW, 1)
 
     def test_numbers_are_unique(self):
         self.brief()
         with self.assertRaises(ConflictError):
-            self.service.create_brief("brief-2", "project-1", 1, "a", "g", "o", "x", "cta", "tg", "c", 30, 45, [], "v", ["source-1"], "u", NOW)
+            self.service.create_brief("brief-2", "project-1", 1, "a", "g", "o", "x", "cta", "tg", "c", 30, 45, [], "v", ["source-1"], "u", NOW, 2)
 
     def test_revision_is_immutable_and_scoped_to_project(self):
         self.brief()
-        revision = self.service.create_revision("revision-1", "project-1", "brief-1", 1, None, "Script", "Caption", [], {"script": "v1"}, "owner", NOW)
+        revision = self.service.create_revision("revision-1", "project-1", "brief-1", 1, None, "Script", "Caption", [], {"script": "v1"}, "owner", NOW, 2)
         self.assertEqual(revision.revision_no, 1)
         self.assertFalse(hasattr(self.service, "update_revision"))
         with self.assertRaises(ConflictError):
-            self.service.create_revision("revision-2", "project-1", "brief-1", 1, None, "Other", "Caption", [], {}, "owner", NOW)
+            self.service.create_revision("revision-2", "project-1", "brief-1", 1, None, "Other", "Caption", [], {}, "owner", NOW, 3)
 
     def test_revision_rejects_cross_project_brief(self):
         self.brief()
         self.service.create_project("project-2", "pilot-1", "Other", "owner", ["source-1"], NOW)
         with self.assertRaises(ValidationError):
-            self.service.create_revision("r", "project-2", "brief-1", 1, None, "S", "C", [], {}, "owner", NOW)
+            self.service.create_revision("r", "project-2", "brief-1", 1, None, "S", "C", [], {}, "owner", NOW, 1)
+
+    def test_project_compare_and_swap_and_revision_lineage(self):
+        self.brief()
+        with self.assertRaises(ConflictError):
+            self.service.create_revision("stale", "project-1", "brief-1", 1, None, "S", "C", [], {}, "owner", NOW, 1)
+        first = self.service.create_revision("revision-1", "project-1", "brief-1", 1, None, "S", "C", [], {}, "owner", NOW, 2)
+        with self.assertRaises(ValidationError):
+            self.service.create_revision("revision-3", "project-1", "brief-1", 3, None, "S", "C", [], {}, "owner", NOW, 3)
+        second = self.service.create_revision("revision-2", "project-1", "brief-1", 2, first.id, "S2", "C2", [], {}, "owner", NOW, 3)
+        self.assertEqual(second.revision_no, 2)
 
 
 if __name__ == "__main__":

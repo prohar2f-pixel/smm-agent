@@ -53,6 +53,10 @@ class SourceServiceTests(unittest.TestCase):
         self.capture()
         with self.assertRaises(ValidationError):
             self.service.verify_source("source-1", 1, "allowed", None, "clear", "actor", NOW)
+        with self.assertRaises(ValidationError):
+            self.service.verify_source("source-1", 1, "allowed", "   ", "clear", "actor", NOW)
+        with self.assertRaises(ValidationError):
+            self.service.verify_source("source-1", 1, "denied", None, "clear", "", NOW)
 
     def test_compare_and_swap_rejects_stale_version(self):
         self.capture()

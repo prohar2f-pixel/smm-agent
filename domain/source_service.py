@@ -74,8 +74,12 @@ class SourceService:
     ) -> SourceRecord:
         if rights_status not in RIGHTS or privacy_status not in PRIVACY:
             raise ValidationError("invalid rights or privacy status")
-        if rights_status == "allowed" and not rights_evidence_ref:
+        if rights_status == "allowed" and (
+            not rights_evidence_ref or not rights_evidence_ref.strip()
+        ):
             raise ValidationError("allowed sources require rights evidence")
+        if not actor_id or not actor_id.strip() or not verified_at or not verified_at.strip():
+            raise ValidationError("verification actor and timestamp are required")
         with self.repository.transaction() as connection:
             cursor = connection.execute(
                 """UPDATE sources SET rights_status=?,rights_evidence_ref=?,
@@ -99,7 +103,11 @@ class SourceService:
             record = self.get_source(source_id)
             if record.pilot_id != pilot_id:
                 raise ValidationError(f"cross-pilot source: {source_id}")
-            if record.rights_status != "allowed" or not record.rights_evidence_ref:
+            if (
+                record.rights_status != "allowed"
+                or not record.rights_evidence_ref
+                or not record.rights_evidence_ref.strip()
+            ):
                 raise ValidationError(f"source rights are not allowed: {source_id}")
             if record.privacy_status != "clear":
                 raise ValidationError(f"source privacy is not clear: {source_id}")

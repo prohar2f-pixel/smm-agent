@@ -112,7 +112,7 @@ class R1SchemaTests(unittest.TestCase):
     def test_migration_chain_reaches_version_three(self):
         applied = run_migrations(self.db_path)
 
-        self.assertEqual(applied, [1, 2, 3])
+        self.assertEqual(applied, [1, 2, 3, 4])
 
     def test_foreign_keys_reject_missing_pilot_and_revision(self):
         run_migrations(self.db_path)
@@ -251,6 +251,41 @@ class R1SchemaTests(unittest.TestCase):
             ):
                 with self.assertRaises(sqlite3.IntegrityError):
                     connection.execute(f"DELETE FROM {table} WHERE id = ?", (record_id,))
+
+    def test_database_guards_reject_cross_scope_links(self):
+        self.migrate_and_seed()
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO pilot_passports(
+                id,name,status,timezone,evaluation_mode,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?)""",
+                ("pilot-2", "Other", "draft", "UTC", "internal_efficiency", NOW, NOW),
+            )
+            connection.execute(
+                """INSERT INTO sources(
+                id,pilot_id,kind,original_ref,captured_at,content_sha256,
+                rights_status,rights_evidence_ref,privacy_status,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                ("source-2", "pilot-2", "file", "other", NOW, "d" * 64,
+                 "allowed", "consent", "clear", NOW, NOW),
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    "INSERT INTO content_project_sources(project_id,source_id,created_at) VALUES(?,?,?)",
+                    ("project-1", "source-2", NOW),
+                )
+            connection.execute(
+                """INSERT INTO claims(id,revision_id,text,location_json,status,checked_by,checked_at,created_at)
+                VALUES(?,?,?,?,?,?,?,?)""",
+                ("claim-1", "revision-1", "Fact", "{}", "supported", "checker", NOW, NOW),
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """INSERT INTO claim_evidence(
+                    id,claim_id,source_id,excerpt,applicability_note,checked_by,checked_at,created_at
+                    ) VALUES(?,?,?,?,?,?,?,?)""",
+                    ("e-1", "claim-1", "source-2", "text", "note", "checker", NOW, NOW),
+                )
 
 
 if __name__ == "__main__":
