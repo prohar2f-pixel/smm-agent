@@ -10,6 +10,7 @@ from domain.budget_service import (
     BudgetConfigurationError, BudgetContext, BudgetService, BudgetUnavailableError,
 )
 from domain.errors import ConflictError, ValidationError
+from domain.cost_service import CostService
 from domain.readiness_service import ReadinessService
 
 
@@ -102,6 +103,21 @@ class BudgetReservationTests(unittest.TestCase):
         balances = self.service.availability(self.context, "RUB", NOW)
         self.assertEqual({key: value["available"] for key, value in balances.items()},
                          {key: 7000 for key in ("operation", "project", "pilot", "day", "month")})
+
+    def test_partial_settlement_counts_charge_plus_remaining_hold_once(self):
+        self.configure()
+        self.reserve(amount=3000)
+        CostService(ContentRepository(self.path)).record_charge(
+            "entry-1", "operation-1", "reservation-1", "openrouter", "bill-1",
+            1000, "RUB", NOW, final=False,
+        )
+        balances = self.service.availability(self.context, "RUB", NOW)
+        self.assertEqual(
+            {key: (value["committed"], value["outstanding"], value["available"])
+             for key, value in balances.items()},
+            {key: (1000, 2000, 7000)
+             for key in ("operation", "project", "pilot", "day", "month")},
+        )
 
     def test_concurrent_reserves_allow_only_one_when_available_is_5000(self):
         self.configure(5000)

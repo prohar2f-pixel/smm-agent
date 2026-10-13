@@ -217,7 +217,7 @@ class BudgetService:
         result = {}
         for scope, limit in limits.items():
             outstanding = connection.execute(
-                """SELECT COALESCE(SUM(s.exposure_minor),0)
+                """SELECT COALESCE(SUM(r.held_minor),0)
                 FROM budget_reservation_scopes s JOIN budget_reservations r ON r.id=s.reservation_id
                 WHERE s.limit_id=? AND r.status IN ('held','partially_settled','unknown','overspent')""",
                 (limit["id"],),
