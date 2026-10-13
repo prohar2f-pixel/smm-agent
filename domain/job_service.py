@@ -121,8 +121,9 @@ class JobService:
             cursor = connection.execute(
                 """UPDATE jobs SET operation_id=?,external_intent_at=?,updated_at=?,
                 row_version=row_version+1 WHERE id=? AND status='running'
-                AND lease_owner=? AND fence_token=? AND external_intent_at IS NULL""",
-                (operation_id, at, at, job_id, worker_id, fence_token),
+                AND lease_owner=? AND fence_token=? AND lease_until>=?
+                AND external_intent_at IS NULL""",
+                (operation_id, at, at, job_id, worker_id, fence_token, at),
             )
             if cursor.rowcount != 1:
                 self._transition_failure(connection, job_id)
@@ -146,7 +147,7 @@ class JobService:
             if row is None:
                 raise NotFoundError(f"job not found: {job_id}")
             if (row["status"] != "running" or row["lease_owner"] != worker_id
-                    or row["fence_token"] != fence_token):
+                    or row["fence_token"] != fence_token or row["lease_until"] < at):
                 raise ConflictError("stale job lease")
             if row["external_intent_at"] is not None:
                 raise JobStateError("job after external intent requires reconciliation")
@@ -157,7 +158,7 @@ class JobService:
             )
         return self.get(job_id)
 
-    def cancel(self, job_id, at):
+    def cancel(self, job_id, at, worker_id=None, fence_token=None):
         with self.repository.transaction() as connection:
             row = connection.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
             if row is None:
@@ -166,6 +167,11 @@ class JobService:
                 raise JobStateError("cannot cancel after external intent")
             if row["status"] not in ("queued", "failed", "running"):
                 raise JobStateError(f"cannot cancel job in {row['status']}")
+            if row["status"] == "running" and (
+                row["lease_owner"] != worker_id or row["fence_token"] != fence_token
+                or row["lease_until"] < at
+            ):
+                raise ConflictError("running cancellation requires the current lease")
             connection.execute(
                 """UPDATE jobs SET status='cancelled',lease_owner=NULL,lease_until=NULL,
                 updated_at=?,row_version=row_version+1 WHERE id=?""", (at, job_id),
@@ -185,12 +191,28 @@ class JobService:
                 updated_at=?,row_version=row_version+1 WHERE status='running'
                 AND lease_until<? AND external_intent_at IS NULL""", (now, now),
             ).rowcount
+            expired = connection.execute(
+                """SELECT id,operation_id FROM jobs WHERE status='running' AND lease_until<?
+                   AND external_intent_at IS NOT NULL""", (now,),
+            ).fetchall()
             unknown = connection.execute(
                 """UPDATE jobs SET status='unknown_outcome',lease_owner=NULL,lease_until=NULL,
                 error_code='LEASE_EXPIRED_AFTER_INTENT',updated_at=?,row_version=row_version+1
                 WHERE status='running' AND lease_until<? AND external_intent_at IS NOT NULL""",
                 (now, now),
             ).rowcount
+            for row in expired:
+                if row["operation_id"] is None:
+                    continue
+                connection.execute(
+                    """UPDATE external_operations SET status='unknown_outcome',billing_status='unknown',
+                       error_code='LEASE_EXPIRED_AFTER_INTENT',updated_at=?,row_version=row_version+1
+                       WHERE id=?""", (now, row["operation_id"]),
+                )
+                connection.execute(
+                    """UPDATE budget_reservations SET status='unknown',updated_at=?,
+                       row_version=row_version+1 WHERE operation_id=?""", (now, row["operation_id"]),
+                )
         return requeued, unknown
 
     def _owned_transition(self, job_id, worker_id, fence_token, status, at, fields, values):
@@ -198,8 +220,8 @@ class JobService:
             cursor = connection.execute(
                 f"""UPDATE jobs SET status=?,{fields},lease_owner=NULL,lease_until=NULL,
                 updated_at=?,row_version=row_version+1 WHERE id=? AND status='running'
-                AND lease_owner=? AND fence_token=?""",
-                (status, *values, at, job_id, worker_id, fence_token),
+                AND lease_owner=? AND fence_token=? AND lease_until>=?""",
+                (status, *values, at, job_id, worker_id, fence_token, at),
             )
             if cursor.rowcount != 1:
                 self._transition_failure(connection, job_id)

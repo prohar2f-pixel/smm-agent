@@ -196,6 +196,30 @@ class BudgetReservationTests(unittest.TestCase):
         with sqlite3.connect(self.path) as c:
             self.assertEqual(c.execute("SELECT COUNT(*) FROM budget_reservations").fetchone()[0], 0)
 
+    def test_cross_pilot_lineage_and_untrusted_calendar_scope_are_rejected(self):
+        with sqlite3.connect(self.path) as c:
+            c.execute(
+                """INSERT INTO pilot_passports(id,name,status,timezone,evaluation_mode,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?)""",
+                ("pilot-2", "P2", "running", "UTC", "internal_efficiency", NOW, NOW),
+            )
+        self.configure()
+        self.service.configure_limit(
+            "limit-pilot-2", "pilot", "pilot-2", None, None, "RUB", 10000, None, "owner", NOW,
+        )
+        wrong_pilot = BudgetContext(
+            "pilot-2", "project-1", "revision-1", "llm", "2026-10-13", "2026-10"
+        )
+        with self.assertRaises(BudgetUnavailableError):
+            self.service.reserve("cross", "cross-r", "cross-op", "cross-job", wrong_pilot,
+                                 100, "RUB", HASH, "openrouter", NOW)
+        wrong_day = BudgetContext(
+            "pilot-1", "project-1", "revision-1", "llm", "2099-01-01", "2099-01"
+        )
+        with self.assertRaises(BudgetUnavailableError):
+            self.service.reserve("date", "date-r", "date-op", "date-job", wrong_day,
+                                 100, "RUB", HASH, "openrouter", NOW)
+
 
 if __name__ == "__main__":
     unittest.main()

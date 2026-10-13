@@ -7,8 +7,8 @@ the transaction and accounting core for paid structured LLM work. It is not the
 full product DoD R2.
 
 The core is disabled by architecture: no bot handler, APScheduler task, worker,
-publisher or production startup path imports or invokes it. Applying migration 005
-creates tables only. It does not enqueue work, call OpenRouter, render media or
+publisher or production startup path imports or invokes it. Applying migrations 005
+and 006 creates tables and integrity guards only. It does not enqueue work, call OpenRouter, render media or
 publish content.
 
 Deferred packages include idea intake and scoring, media/render pipelines,
@@ -102,8 +102,8 @@ package.
 - Branch: `feat/content-factory-r2-core`
 - Integration base: `335fbd4`
 - Implementation head before this documentation commit: `23c4007`
-- Database migration: version 5, `005_r2_jobs_budget_llm.sql`
-- Automated suite at evidence capture: 98 tests passing
+- Database migration: version 6, `006_r2_integrity_guards.sql`
+- Automated suite after review fixes: 106 tests passing
 - Network posture: deterministic fake transports only, zero real provider calls
 
 Verification commands:
@@ -120,6 +120,6 @@ Telegram/VK publication, Railway migration or any production behavior.
 ## Rollback
 
 The safe rollback is code-level: keep the feature unwired and return to the
-integration base or omit the R2 commits. Migration 005 is additive. Do not delete
+integration base or omit the R2 commits. Migrations 005 and 006 are additive. Do not delete
 its tables from a database that may contain operations, reservations or cost
 evidence. Restore a verified pre-migration backup if schema rollback is required.

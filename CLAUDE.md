@@ -109,7 +109,7 @@ R2 package 3 adds disabled infrastructure for durable jobs, multi-scope budget
 reservations, immutable cost evidence, versioned prompts and schema-validated LLM
 runs. The implementation lives in `domain/job_service.py`,
 `domain/budget_service.py`, `domain/cost_service.py` and `llm/` with schema version
-5 in `db/migrations/005_r2_jobs_budget_llm.sql`.
+6 in `db/migrations/006_r2_integrity_guards.sql` (after the R2 tables in migration 005).
 
 No Telegram handler, scheduler, worker, publisher or production startup path calls
 this core. A provider timeout is an `unknown_outcome`: the reservation remains held

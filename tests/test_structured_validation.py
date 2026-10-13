@@ -31,6 +31,8 @@ class StructuredValidationTests(unittest.TestCase):
             '{"title":"Demo"}',
             '{"title":"Demo","created_at":"2026-10-13T12:00:00Z","extra":1}',
             '{"title":"Demo","created_at":"yesterday"}',
+            '{"title":"Demo","created_at":"2026-10-13T12:00:00"}',
+            '{"title":"Demo","created_at":"2026-10-13T12:00:00Z","extra":NaN}',
         )
         for raw in invalid:
             with self.subTest(raw=raw), self.assertRaises(StructuredValidationError):

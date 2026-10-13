@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from db.content_repository import ContentRepository
 from domain.errors import ConflictError, NotFoundError, ValidationError
@@ -120,10 +122,25 @@ class BudgetService:
                 return _reservation(existing)
 
             pilot = connection.execute(
-                "SELECT status FROM pilot_passports WHERE id=?", (context.pilot_id,)
+                "SELECT status,timezone FROM pilot_passports WHERE id=?", (context.pilot_id,)
             ).fetchone()
             if pilot is None or pilot["status"] != "running":
                 raise BudgetUnavailableError("pilot is not running")
+            lineage = connection.execute(
+                """SELECT 1 FROM content_projects p JOIN content_revisions r ON r.project_id=p.id
+                   WHERE p.id=? AND p.pilot_id=? AND r.id=?""",
+                (context.project_id, context.pilot_id, context.revision_id),
+            ).fetchone()
+            if lineage is None:
+                raise BudgetUnavailableError("pilot/project/revision lineage mismatch")
+            try:
+                local = datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone(
+                    ZoneInfo(pilot["timezone"])
+                )
+            except (ValueError, ZoneInfoNotFoundError) as exc:
+                raise BudgetConfigurationError("invalid timestamp or pilot timezone") from exc
+            if context.day_ref != local.date().isoformat() or context.month_ref != local.strftime("%Y-%m"):
+                raise BudgetUnavailableError("untrusted day or month budget scope")
             if connection.execute(
                 "SELECT 1 FROM budget_incidents WHERE pilot_id=? AND status='open'",
                 (context.pilot_id,),

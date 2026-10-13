@@ -101,6 +101,28 @@ class CostServiceTests(unittest.TestCase):
         again = self.service.reconcile("op", "no_charge", "provider:absent", NOW)
         self.assertEqual(again, released)
 
+    def test_refund_rejects_cross_operation_provider_and_currency(self):
+        self.charge(1000)
+        for operation, provider, currency in (
+            ("other", "openrouter", "RUB"), ("op", "other", "RUB"), ("op", "openrouter", "USD")
+        ):
+            with self.subTest(operation=operation, provider=provider, currency=currency):
+                with self.assertRaises(ValidationError):
+                    self.service.record_refund(
+                        f"refund-{operation}-{provider}-{currency}", operation, "reservation",
+                        provider, f"evidence-{operation}-{provider}-{currency}", 100,
+                        currency, NOW,
+                    )
+
+    def test_no_charge_after_confirmed_charge_opens_incident(self):
+        self.charge(1000)
+        with self.assertRaises(ReconciliationRequiredError):
+            self.service.reconcile("op", "no_charge", "provider:none", NOW)
+        with sqlite3.connect(self.path) as c:
+            self.assertEqual(c.execute(
+                "SELECT kind,status FROM budget_incidents"
+            ).fetchone(), ("contradictory_evidence", "open"))
+
 
 if __name__ == "__main__":
     unittest.main()

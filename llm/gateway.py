@@ -67,7 +67,7 @@ class StructuredLlmGateway:
 
     @staticmethod
     def _canonical(value: Any) -> str:
-        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
     @classmethod
     def canonical_input_hash(cls, input_data: dict[str, Any]) -> str:
@@ -86,16 +86,20 @@ class StructuredLlmGateway:
         currency: str,
         transport: LlmTransport,
     ) -> LlmRunResult:
-        existing = self._existing(run_id)
-        if existing is not None:
-            return existing
         self._guard_configuration(model, currency, upper_bound_minor, input_data)
         prompt = self.registry.get(prompt_name, prompt_version)
         input_hash = self.canonical_input_hash(input_data)
         request_hash = self.canonical_input_hash({
             "purpose": purpose, "prompt": [prompt_name, prompt_version], "model": model,
             "input": input_data, "currency": currency, "upper_bound_minor": upper_bound_minor,
+            "provider": transport.provider_key, "budget_context": budget_context.__dict__,
         })
+        existing = self._existing(
+            run_id, request_hash, transport.provider_key, purpose, prompt_name,
+            prompt_version, model, input_hash, currency,
+        )
+        if existing is not None:
+            return existing
         operation_id = f"operation:{run_id}"
         reservation_id = f"reservation:{run_id}"
         job_id = f"job:{run_id}"
@@ -112,11 +116,17 @@ class StructuredLlmGateway:
         error_code: str | None = None
         raw_hash: str | None = None
         output_ref: str | None = None
+        original_user = user
+        previous_raw = ""
+        previous_error = ""
 
         for attempt in (1, 2):
             if attempt == 2:
                 user = (
                     "Return only JSON matching the schema. Do not add Markdown or commentary.\n"
+                    f"Original task:\n{original_user}\n"
+                    f"Previous response:\n{previous_raw}\n"
+                    f"Validation error: {previous_error}\n"
                     f"Schema: {self._canonical(prompt.output_schema)}"
                 )
             try:
@@ -138,25 +148,35 @@ class StructuredLlmGateway:
             responses.append(response)
             raw_hash = hashlib.sha256(response.text.encode("utf-8")).hexdigest()
             output_ref = response.output_ref
+            validation_status = "valid"
             try:
                 output = self.validator.parse(response.text, prompt.output_schema)
-                break
-            except StructuredValidationError:
+            except StructuredValidationError as exc:
+                validation_status = "invalid"
                 error_code = "structured_output_invalid"
+                previous_raw = response.text
+                previous_error = str(exc)
+            self._persist_attempt(
+                run_id, operation_id, attempt, transport.provider_key, response,
+                validation_status, output,
+            )
+            terminal = output is not None or attempt == 2
+            if response.cost_minor > 0:
+                self.costs.record_charge(
+                    f"cost:{run_id}:{attempt}", operation_id, reservation_id,
+                    transport.provider_key, response.evidence_id, response.cost_minor,
+                    currency, self.now(), final=terminal,
+                )
+            if terminal:
+                break
 
         status = "valid" if output is not None else "invalid"
         total_cost = sum(item.cost_minor for item in responses)
-        charged = [(index, item) for index, item in enumerate(responses) if item.cost_minor > 0]
-        for charged_index, (index, item) in enumerate(charged):
-            final = charged_index == len(charged) - 1
-            self.costs.record_charge(
-                f"cost:{run_id}:{index + 1}", operation_id, reservation_id,
-                transport.provider_key, item.evidence_id, item.cost_minor, currency,
-                self.now(), final=final,
-            )
-        if not charged:
+        if total_cost == 0:
             evidence = ",".join(item.evidence_id for item in responses)
             self.costs.mark_no_charge(operation_id, f"provider:{evidence}", self.now())
+        elif responses[-1].cost_minor == 0:
+            self.costs.finalize_charges(operation_id, reservation_id, self.now())
         self._persist_final(
             run_id, operation_id, job_id, purpose, prompt_name, prompt_version,
             model, input_hash, raw_hash, status, len(responses), responses,
@@ -189,16 +209,33 @@ class StructuredLlmGateway:
         if not isinstance(upper_bound, int) or upper_bound <= 0:
             raise ValidationError("positive upper bound is required")
         price = self.pricing.get(model)
-        if price is None or price.get("currency") != currency:
+        required = ("input_per_million_minor", "output_per_million_minor",
+                    "max_input_tokens", "max_output_tokens", "exchange_basis")
+        if (price is None or price.get("currency") != currency
+                or any(not isinstance(price.get(key), int) or price[key] <= 0
+                       for key in required[:4])
+                or not isinstance(price.get("exchange_basis"), str)
+                or not price["exchange_basis"].strip()):
             raise ValidationError("model price is missing for requested currency")
+        conservative = max(1, (
+            price["input_per_million_minor"] * price["max_input_tokens"]
+            + price["output_per_million_minor"] * price["max_output_tokens"]
+            + 999_999
+        ) // 1_000_000)
+        if upper_bound < conservative:
+            raise ValidationError("upper bound is below configured worst-case price")
 
-    def _existing(self, run_id: str) -> LlmRunResult | None:
+    def _existing(self, run_id: str, request_hash: str, provider_key: str,
+                  purpose: str, prompt_name: str, prompt_version: str, model: str,
+                  input_hash: str, currency: str) -> LlmRunResult | None:
         row = self.repository.fetchone(
-            """SELECT p.*,o.result_json FROM prompt_runs p
+            """SELECT p.*,o.result_json,o.request_sha256,o.provider_key FROM prompt_runs p
                JOIN external_operations o ON o.id=p.operation_id WHERE p.command_id=?""",
             (run_id,),
         )
         if row is not None:
+            if row["request_sha256"] != request_hash or row["provider_key"] != provider_key:
+                raise ConflictError("run id was already used with a different request")
             stored = json.loads(row["result_json"]) if row["result_json"] else None
             output = stored.get("output") if isinstance(stored, dict) and "responses" in stored else stored
             return LlmRunResult(
@@ -206,17 +243,46 @@ class StructuredLlmGateway:
                 row["cost_minor"] or 0, row["error_code"],
             )
         operation = self.repository.fetchone(
-            "SELECT status FROM external_operations WHERE command_id=?", (run_id,),
+            "SELECT status,request_sha256,provider_key FROM external_operations WHERE command_id=?", (run_id,),
         )
         if operation is not None:
-            raise ReconciliationRequiredError(
-                f"run {run_id} is in-flight or requires reconciliation"
+            if operation["request_sha256"] != request_hash or operation["provider_key"] != provider_key:
+                raise ConflictError("run id was already used with a different request")
+            attempts = self.repository.fetchall(
+                "SELECT * FROM llm_attempts WHERE run_id=? ORDER BY attempt_no", (run_id,)
             )
+            terminal = attempts and (
+                attempts[-1]["validation_status"] == "valid" or attempts[-1]["attempt_no"] == 2
+            )
+            if terminal and operation["status"] in {"succeeded", "failed", "reconciled"}:
+                last = attempts[-1]
+                output = json.loads(last["validated_output_json"]) if last["validated_output_json"] else None
+                status = "valid" if output is not None else "invalid"
+                self._persist_final(
+                    run_id, f"operation:{run_id}", f"job:{run_id}", purpose,
+                    prompt_name, prompt_version, model, input_hash, None, status,
+                    len(attempts), [], sum(row["cost_minor"] for row in attempts),
+                    currency, last["response_ref"],
+                    None if status == "valid" else "structured_output_invalid", output,
+                )
+                return self._existing(
+                    run_id, request_hash, provider_key, purpose, prompt_name,
+                    prompt_version, model, input_hash, currency,
+                )
+            raise ReconciliationRequiredError(f"run {run_id} is in-flight or requires reconciliation")
         return None
 
     def _mark_submitting(self, operation_id: str, job_id: str) -> None:
         at = self.now()
         with self.repository.transaction() as connection:
+            job = connection.execute(
+                """UPDATE jobs SET status='running',lease_owner=?,fence_token=fence_token+1,
+                   attempt_count=attempt_count+1,external_intent_at=?,updated_at=?,row_version=row_version+1
+                   WHERE id=? AND status='queued' AND external_intent_at IS NULL""",
+                (f"gateway:{job_id}", at, at, job_id),
+            )
+            if job.rowcount != 1:
+                raise ReconciliationRequiredError("job is already owned by another executor")
             cursor = connection.execute(
                 """UPDATE external_operations SET status='submitting',updated_at=?,
                    row_version=row_version+1 WHERE id=? AND status='intent'""",
@@ -224,9 +290,22 @@ class StructuredLlmGateway:
             )
             if cursor.rowcount != 1:
                 raise ReconciliationRequiredError("operation is already in-flight")
+
+    def _persist_attempt(self, run_id, operation_id, attempt, provider, response,
+                         validation_status, output):
+        digest = hashlib.sha256(response.text.encode("utf-8")).hexdigest()
+        with self.repository.transaction() as connection:
             connection.execute(
-                """UPDATE jobs SET status='running',attempt_count=1,external_intent_at=?,
-                   updated_at=?,row_version=row_version+1 WHERE id=?""", (at, at, job_id),
+                """INSERT INTO llm_attempts(id,run_id,operation_id,attempt_no,idempotency_key,
+                   response_sha256,response_ref,validation_status,validated_output_json,
+                   input_tokens,output_tokens,latency_ms,cost_minor,currency,model,provider,
+                   evidence_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (f"attempt:{run_id}:{attempt}", run_id, operation_id, attempt,
+                 f"{run_id}:{attempt}", digest, response.output_ref, validation_status,
+                 self._canonical(output) if output is not None else None,
+                 response.input_tokens, response.output_tokens, response.latency_ms,
+                 response.cost_minor, response.currency, response.model, provider,
+                 response.evidence_id, self.now()),
             )
 
     def _mark_unknown(self, operation_id: str, job_id: str, error_code: str) -> None:
@@ -256,18 +335,26 @@ class StructuredLlmGateway:
         total_cost, currency, output_ref, error_code, output,
     ):
         at = self.now()
-        input_tokens = sum(item.input_tokens for item in responses)
-        output_tokens = sum(item.output_tokens for item in responses)
-        latency = sum(item.latency_ms for item in responses)
+        attempt_rows = self.repository.fetchall(
+            "SELECT * FROM llm_attempts WHERE run_id=? ORDER BY attempt_no", (run_id,)
+        )
+        input_tokens = sum(row["input_tokens"] for row in attempt_rows)
+        output_tokens = sum(row["output_tokens"] for row in attempt_rows)
+        latency = sum(row["latency_ms"] for row in attempt_rows)
+        total_cost = sum(row["cost_minor"] for row in attempt_rows)
+        output_hash = attempt_rows[-1]["response_sha256"]
+        output_ref = attempt_rows[-1]["response_ref"]
         response_evidence = [
-            {
-                "sha256": hashlib.sha256(item.text.encode("utf-8")).hexdigest(),
-                "ref": item.output_ref,
-            }
-            for item in responses
+            {"sha256": row["response_sha256"], "ref": row["response_ref"]}
+            for row in attempt_rows
         ]
         result_json = self._canonical({"output": output, "responses": response_evidence})
         job_result_json = self._canonical(output) if output is not None else None
+        result_hash = hashlib.sha256(result_json.encode("utf-8")).hexdigest()
+        job_result_hash = (
+            hashlib.sha256(job_result_json.encode("utf-8")).hexdigest()
+            if job_result_json is not None else output_hash
+        )
         with self.repository.transaction() as connection:
             connection.execute(
                 """INSERT INTO prompt_runs(id,command_id,operation_id,purpose,prompt_name,
@@ -282,11 +369,11 @@ class StructuredLlmGateway:
                 """UPDATE external_operations SET status=?,result_json=?,result_sha256=?,
                    error_code=?,updated_at=?,row_version=row_version+1 WHERE id=?""",
                 ("succeeded" if status == "valid" else "failed", result_json,
-                 output_hash, error_code, at, operation_id),
+                 result_hash, error_code, at, operation_id),
             )
             connection.execute(
                 """UPDATE jobs SET status=?,attempt_count=?,result_json=?,result_sha256=?,
                    error_code=?,updated_at=?,row_version=row_version+1 WHERE id=?""",
                 ("succeeded" if status == "valid" else "failed", attempts, job_result_json,
-                 output_hash, error_code, at, job_id),
+                 job_result_hash, error_code, at, job_id),
             )

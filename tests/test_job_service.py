@@ -67,6 +67,15 @@ class JobServiceTests(unittest.TestCase):
         with self.assertRaises(ConflictError):
             self.service.succeed("job-1", "worker", 0, {"ok": True}, NOW)
 
+    def test_expired_owner_cannot_complete_or_cancel_running_job(self):
+        self.enqueue()
+        claim = self.service.claim_next("worker", NOW, "2026-10-13T12:01:00+00:00")
+        late = "2026-10-13T12:02:00+00:00"
+        with self.assertRaises(ConflictError):
+            self.service.succeed("job-1", "worker", claim.fence_token, {"ok": True}, late)
+        with self.assertRaises(ConflictError):
+            self.service.cancel("job-1", NOW)
+
     def test_retryable_failure_requeues_without_external_intent(self):
         self.enqueue()
         claim = self.service.claim_next("worker", NOW, LATER)

@@ -23,8 +23,8 @@ class R2SchemaTests(unittest.TestCase):
         connection.execute("PRAGMA foreign_keys=ON")
         return connection
 
-    def test_migration_chain_reaches_version_five(self):
-        self.assertEqual(run_migrations(self.path), [1, 2, 3, 4, 5])
+    def test_migration_chain_reaches_version_six(self):
+        self.assertEqual(run_migrations(self.path), [1, 2, 3, 4, 5, 6])
 
     def test_r2_tables_and_claim_indexes_exist(self):
         run_migrations(self.path)
@@ -32,7 +32,7 @@ class R2SchemaTests(unittest.TestCase):
             "jobs", "external_operations", "budget_limits",
             "budget_reservations", "budget_reservation_scopes",
             "cost_entries", "budget_incidents", "prompt_templates",
-            "prompt_runs", "revision_prompt_runs",
+            "prompt_runs", "revision_prompt_runs", "llm_attempts",
         }
         with self.connect() as connection:
             tables = {row[0] for row in connection.execute(

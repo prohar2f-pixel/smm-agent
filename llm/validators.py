@@ -28,8 +28,13 @@ class StructuredOutputValidator:
         if match:
             candidate = match.group("body")
         try:
-            value = json.loads(candidate)
-        except (json.JSONDecodeError, TypeError) as exc:
+            value = json.loads(
+                candidate,
+                parse_constant=lambda constant: (_ for _ in ()).throw(
+                    ValueError(f"non-finite number: {constant}")
+                ),
+            )
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
             raise StructuredValidationError("model output is not valid JSON") from exc
         if not isinstance(value, dict):
             raise StructuredValidationError("model output root must be an object")
@@ -40,10 +45,10 @@ class StructuredOutputValidator:
             if not isinstance(value, str):
                 return False
             try:
-                datetime.fromisoformat(value.replace("Z", "+00:00"))
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
             except ValueError:
                 return False
-            return "T" in value
+            return "T" in value and parsed.tzinfo is not None
 
         validator = Draft202012Validator(schema, format_checker=format_checker)
         errors = sorted(validator.iter_errors(value), key=lambda error: list(error.absolute_path))

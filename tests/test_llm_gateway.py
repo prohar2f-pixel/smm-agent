@@ -10,6 +10,7 @@ from domain.budget_service import BudgetContext, BudgetService
 from domain.cost_service import CostService, ReconciliationRequiredError
 from domain.errors import ConflictError, ValidationError
 from domain.readiness_service import ReadinessService
+from domain.job_service import JobService
 from llm.gateway import StructuredLlmGateway, TransportResponse
 from llm.prompt_registry import PromptRegistry
 
@@ -69,7 +70,10 @@ class LlmGatewayTests(unittest.TestCase):
         self._configure_limits()
         self.gateway = StructuredLlmGateway(
             self.repository, self.registry, self.budgets, self.costs,
-            pricing={"model-safe": {"currency": "RUB"}}, now=lambda: NOW,
+            pricing={"model-safe": {"currency": "RUB", "input_per_million_minor": 1000,
+                                     "output_per_million_minor": 2000,
+                                     "max_input_tokens": 1000, "max_output_tokens": 1000,
+                                     "exchange_basis": "provider-rub"}}, now=lambda: NOW,
         )
 
     def tearDown(self):
@@ -143,7 +147,10 @@ class LlmGatewayTests(unittest.TestCase):
         self.gateway.pricing = {}
         with self.assertRaises(ValidationError):
             self.run_gateway(transport)
-        self.gateway.pricing = {"model-safe": {"currency": "RUB"}}
+        self.gateway.pricing = {"model-safe": {"currency": "RUB", "input_per_million_minor": 1000,
+                                                "output_per_million_minor": 2000,
+                                                "max_input_tokens": 1000, "max_output_tokens": 1000,
+                                                "exchange_basis": "provider-rub"}}
         with sqlite3.connect(self.path) as c:
             c.execute("DELETE FROM budget_limits WHERE scope_type='day'")
         with self.assertRaises(ValidationError):
@@ -194,6 +201,8 @@ class LlmGatewayTests(unittest.TestCase):
                          ("valid", {"title": "fixed"}, 2))
         self.assertEqual(transport.calls[1]["attempt"], 2)
         self.assertIn("Return only JSON matching the schema", transport.calls[1]["user"])
+        self.assertIn('"topic":"automation"', transport.calls[1]["user"])
+        self.assertIn("Previous response:\nbad", transport.calls[1]["user"])
 
     def test_second_invalid_is_final_and_cannot_link(self):
         transport = FakeTransport([response("bad", "1"), response("still bad", "2")])
@@ -214,6 +223,53 @@ class LlmGatewayTests(unittest.TestCase):
         self.assertEqual(reservation, ("unknown", 1000))
         with self.assertRaises(ReconciliationRequiredError):
             self.run_gateway(transport)
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_first_billed_attempt_survives_repair_timeout(self):
+        transport = FakeTransport([response("bad", "first", 321), TimeoutError("timeout")])
+        with self.assertRaises(ReconciliationRequiredError):
+            self.run_gateway(transport)
+        with sqlite3.connect(self.path) as c:
+            self.assertEqual(c.execute("SELECT cost_minor FROM llm_attempts").fetchall(), [(321,)])
+            self.assertEqual(c.execute("SELECT amount_minor FROM cost_entries").fetchall(), [(321,)])
+            self.assertEqual(c.execute(
+                "SELECT status,held_minor,settled_minor FROM budget_reservations"
+            ).fetchone(), ("unknown", 679, 321))
+
+    def test_conflicting_completed_replay_is_rejected(self):
+        transport = FakeTransport([response('{"title":"ok"}')])
+        self.run_gateway(transport)
+        with self.assertRaises(ConflictError):
+            self.run_gateway(transport, input_data={"topic": "different"})
+        self.assertEqual(len(transport.calls), 1)
+
+    def test_gateway_does_not_execute_job_claimed_by_another_worker(self):
+        original = self.budgets.reserve
+
+        def reserve_then_steal(*args, **kwargs):
+            record = original(*args, **kwargs)
+            JobService(self.repository).claim_next(
+                "other-worker", NOW, "2026-10-13T12:10:00+00:00"
+            )
+            return record
+
+        self.gateway.budgets.reserve = reserve_then_steal
+        transport = FakeTransport([response('{"title":"unsafe"}')])
+        with self.assertRaises(ReconciliationRequiredError):
+            self.run_gateway(transport)
+        self.assertEqual(transport.calls, [])
+
+    def test_replay_resumes_finalization_after_post_charge_crash(self):
+        transport = FakeTransport([response('{"title":"ok"}', cost=250)])
+        persist = self.gateway._persist_final
+        self.gateway._persist_final = lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("simulated crash")
+        )
+        with self.assertRaises(RuntimeError):
+            self.run_gateway(transport)
+        self.gateway._persist_final = persist
+        result = self.run_gateway(transport)
+        self.assertEqual((result.status, result.cost_minor), ("valid", 250))
         self.assertEqual(len(transport.calls), 1)
 
     def test_valid_run_links_once_only_to_reserved_revision(self):

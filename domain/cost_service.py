@@ -48,6 +48,8 @@ class CostService:
             if duplicate:
                 self._assert_same(duplicate, operation_id, reservation_id, "refund", amount_minor, currency)
                 return self._result(connection, reservation_id)
+            reservation = self._reservation(connection, reservation_id)
+            self._assert_tuple(connection, reservation, operation_id, provider, currency)
             committed = self._net_committed(connection, reservation_id)
             if amount_minor > committed:
                 raise ValidationError("refund exceeds confirmed charges")
@@ -55,7 +57,6 @@ class CostService:
                               provider, evidence_id, "refund", amount_minor,
                               currency, occurred_at)
             net = committed - amount_minor
-            reservation = self._reservation(connection, reservation_id)
             connection.execute(
                 """UPDATE budget_reservations SET settled_minor=?,updated_at=?,
                 row_version=row_version+1 WHERE id=?""", (net, occurred_at, reservation_id),
@@ -77,21 +78,22 @@ class CostService:
                 self._assert_same(duplicate, operation_id, reservation_id, kind, amount_minor, currency)
                 return self._result(connection, reservation_id)
             reservation = self._reservation(connection, reservation_id)
-            if reservation["operation_id"] != operation_id or reservation["currency"] != currency:
-                raise ValidationError("operation or currency mismatch")
+            self._assert_tuple(connection, reservation, operation_id, provider, currency)
             self._insert_cost(connection, entry_id, operation_id, reservation_id,
                               provider, evidence_id, kind, amount_minor, currency,
                               occurred_at)
             committed = self._net_committed(connection, reservation_id)
-            overspent = committed > reservation["upper_bound_minor"]
+            contradictory = reservation["status"] in {"settled", "released", "overspent"}
+            overspent = committed > reservation["upper_bound_minor"] or contradictory
             if overspent:
                 held, status = 0, "overspent"
                 connection.execute(
                     """INSERT OR IGNORE INTO budget_incidents(
                     id,pilot_id,project_id,operation_id,kind,status,details_json,created_at)
                     VALUES(?,?,?,?,?,'open',?,?)""",
-                    (f"incident:{operation_id}", reservation["pilot_id"],
-                     reservation["project_id"], operation_id, "overspend",
+                    (f"incident:{operation_id}:{evidence_id}", reservation["pilot_id"],
+                     reservation["project_id"], operation_id,
+                     "contradictory_evidence" if contradictory else "overspend",
                      json.dumps({"upper": reservation["upper_bound_minor"], "charged": committed},
                                 sort_keys=True, separators=(",", ":")), occurred_at),
                 )
@@ -126,6 +128,25 @@ class CostService:
             )
             return self._result(connection, reservation["id"])
 
+    def finalize_charges(self, operation_id, reservation_id, at) -> SettlementResult:
+        with self.repository.transaction() as connection:
+            reservation = self._reservation(connection, reservation_id)
+            if reservation["operation_id"] != operation_id:
+                raise ValidationError("operation and reservation mismatch")
+            committed = self._net_committed(connection, reservation_id)
+            if committed <= 0:
+                raise ValidationError("no confirmed charge to finalize")
+            connection.execute(
+                """UPDATE budget_reservations SET status='settled',held_minor=0,
+                   settled_minor=?,updated_at=?,row_version=row_version+1 WHERE id=?""",
+                (committed, at, reservation_id),
+            )
+            connection.execute(
+                """UPDATE external_operations SET status='succeeded',billing_status='charged',
+                   updated_at=?,row_version=row_version+1 WHERE id=?""", (at, operation_id),
+            )
+            return self._result(connection, reservation_id)
+
     def mark_no_charge(self, operation_id, evidence_ref, at) -> SettlementResult:
         with self.repository.transaction() as connection:
             operation = connection.execute("SELECT * FROM external_operations WHERE id=?", (operation_id,)).fetchone()
@@ -138,18 +159,34 @@ class CostService:
     def reconcile(self, operation_id, outcome, evidence_ref, at) -> SettlementResult:
         if outcome != "no_charge":
             raise ReconciliationRequiredError("unsupported reconciliation outcome")
+        contradiction = False
         with self.repository.transaction() as connection:
             reservation = self._by_operation(connection, operation_id)
             if reservation["status"] == "released":
                 if reservation["release_evidence_ref"] != evidence_ref:
                     raise ConflictError("reconciliation evidence conflict")
                 return self._result(connection, reservation["id"])
-            return self._release(connection, operation_id, evidence_ref, at)
+            if self._net_committed(connection, reservation["id"]):
+                contradiction = True
+                connection.execute(
+                    """INSERT OR IGNORE INTO budget_incidents(
+                    id,pilot_id,project_id,operation_id,kind,status,details_json,created_at)
+                    VALUES(?,?,?,?,?,'open',?,?)""",
+                    (f"incident:no-charge:{operation_id}", reservation["pilot_id"],
+                     reservation["project_id"], operation_id, "contradictory_evidence",
+                     json.dumps({"evidence_ref": evidence_ref}, sort_keys=True), at),
+                )
+            else:
+                return self._release(connection, operation_id, evidence_ref, at)
+        if contradiction:
+            raise ReconciliationRequiredError("no-charge evidence contradicts confirmed cost")
 
     def _release(self, connection, operation_id, evidence_ref, at):
         if not evidence_ref or not evidence_ref.strip():
             raise ValidationError("release evidence is required")
         reservation = self._by_operation(connection, operation_id)
+        if self._net_committed(connection, reservation["id"]):
+            raise ReconciliationRequiredError("cannot release reservation with confirmed cost")
         connection.execute(
             """UPDATE external_operations SET status='reconciled',billing_status='no_charge',
             updated_at=?,row_version=row_version+1 WHERE id=?""", (at, operation_id),
@@ -195,6 +232,16 @@ class CostService:
         if row is None:
             raise NotFoundError(f"reservation not found: {reservation_id}")
         return row
+
+    @staticmethod
+    def _assert_tuple(connection, reservation, operation_id, provider, currency):
+        operation = connection.execute(
+            "SELECT provider_key FROM external_operations WHERE id=?", (operation_id,)
+        ).fetchone()
+        if (reservation["operation_id"] != operation_id
+                or reservation["currency"] != currency
+                or operation is None or operation["provider_key"] != provider):
+            raise ValidationError("operation, reservation, provider or currency mismatch")
 
     @staticmethod
     def _by_operation(connection, operation_id):
