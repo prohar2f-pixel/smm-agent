@@ -43,6 +43,7 @@ class ScreenDemoPlanner:
         payload["approved_preview_sha256"] = approved_preview_sha256
         manifest = WorkerManifest(
             schema_version=payload["schema_version"], job_id=payload["job_id"],
+            fence_token=payload["fence_token"],
             revision_id=payload["revision_id"], input_sha256=payload["input_sha256"],
             output_path=output_path, render_profile=f"screen-demo-{stage}-v1",
             payload=payload,

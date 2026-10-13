@@ -24,7 +24,7 @@ class R2SchemaTests(unittest.TestCase):
         return connection
 
     def test_migration_chain_reaches_version_six(self):
-        self.assertEqual(run_migrations(self.path), [1, 2, 3, 4, 5, 6, 7, 8, 9])
+        self.assertEqual(run_migrations(self.path), list(range(1, 11)))
 
     def test_r2_tables_and_claim_indexes_exist(self):
         run_migrations(self.path)

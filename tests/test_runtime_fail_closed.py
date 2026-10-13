@@ -4,6 +4,7 @@ from pathlib import Path
 
 from app.runtime import FactoryConfig, FactoryRuntime
 from db.content_repository import ContentRepository
+from domain.errors import ValidationError
 from domain.job_service import JobService
 from workers.runner import WorkerRunner
 
@@ -27,7 +28,7 @@ class RuntimeFailClosedTests(unittest.TestCase):
             path = Path(directory) / "agent.db"
             config = FactoryConfig.from_env({"DB_PATH":str(path), "ADMIN_TELEGRAM_ID":"1"})
             applied = FactoryRuntime(config).startup()
-            self.assertEqual(applied, list(range(1, 10)))
+            self.assertEqual(applied, list(range(1, 11)))
 
     def test_disabled_worker_claims_nothing_but_can_recover_safely(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -40,6 +41,30 @@ class RuntimeFailClosedTests(unittest.TestCase):
             self.assertIsNone(runner.run_once("w","2026-10-13T12:00:00+00:00","2026-10-13T12:05:00+00:00"))
             self.assertEqual(jobs.get("j").status, "queued")
             self.assertEqual(runner.recover("2026-10-13T12:00:00+00:00"), (0,0))
+
+    def test_enabled_action_runtime_requires_configured_pilot_and_artifact_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "agent.db"
+            config = FactoryConfig.from_env({"DB_PATH":str(path),
+                                             "ADMIN_TELEGRAM_ID":"1",
+                                             "FACTORY_WORKER_ENABLED":"true",
+                                             "FACTORY_ARTIFACT_ROOT":str(Path(directory)/"artifacts")})
+            with self.assertRaises(ValidationError):
+                FactoryRuntime(config).startup()
+
+    def test_enabled_worker_requires_registered_handlers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = FactoryConfig(
+                db_path=Path(directory) / "agent.db", admin_telegram_id=1,
+                worker_enabled=True, artifact_root=Path(directory) / "artifacts",
+            )
+            with self.assertRaises(ValidationError):
+                FactoryRuntime(config).worker_runner({})
+
+    def test_main_composes_guarded_publish_and_worker_services(self):
+        source = Path("main.py").read_text()
+        self.assertIn("runtime.publish_service()", source)
+        self.assertIn("runtime.worker_runner({})", source)
 
 
 if __name__ == "__main__":

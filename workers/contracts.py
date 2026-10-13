@@ -32,6 +32,7 @@ def safe_relative_path(value: str | None) -> None:
 class WorkerManifest:
     schema_version: str
     job_id: str
+    fence_token: int
     revision_id: str
     input_sha256: str
     output_path: str
@@ -41,6 +42,8 @@ class WorkerManifest:
     def validate(self) -> None:
         if not SEMVER.fullmatch(self.schema_version):
             raise ValidationError("unsupported manifest schema version")
+        if self.fence_token < 1:
+            raise ValidationError("manifest requires a fence token")
         _hash(self.input_sha256, "input_sha256")
         safe_relative_path(self.output_path)
 

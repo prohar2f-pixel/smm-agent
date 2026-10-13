@@ -20,7 +20,12 @@ class PublishResult:
     evidence_ref: str
 
 
+class DefinitivePublishError(RuntimeError):
+    """Provider proved that no remote publication was accepted."""
+
+
 class PublisherAdapter(Protocol):
+    provider_key: str
     def send(self, request: PublishRequest) -> PublishResult: ...
 
     def reconcile(self, idempotency_key: str) -> PublishResult | None: ...

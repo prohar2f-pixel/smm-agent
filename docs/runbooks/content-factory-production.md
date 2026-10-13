@@ -19,7 +19,7 @@ Deployment never grants permission to publish a package. Start with
 
 1. Deploy `Procfile`. `deployment.launch` exits with code 2 on unsafe config.
 2. Keep publishing and paid generation disabled.
-3. Verify migration versions 1-9 and `/factory_status`.
+3. Verify migration versions 1-10 and `/factory_status`.
 4. Verify queued jobs remain queued and no `publish_attempts` appeared.
 5. Enable only the control plane and worker after the health check.
 

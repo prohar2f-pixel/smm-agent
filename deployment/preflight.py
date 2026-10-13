@@ -44,6 +44,10 @@ def validate_environment(env: dict) -> PreflightResult:
         errors.append("publishing requires control plane and worker")
     if paid and (not control or not worker):
         errors.append("paid generation requires control plane and worker")
+    if any((worker, publishing, paid)):
+        for key in ("FACTORY_PILOT_ID", "FACTORY_ARTIFACT_ROOT", "FACTORY_BACKUP_DIR"):
+            if env.get(key, "").strip().lower() in PLACEHOLDERS:
+                errors.append(f"enabled production actions require {key}")
     if _bool(env, "LEGACY_AUTO_PUBLISH_ENABLED") or _bool(env, "LEGACY_DIRECT_PUBLISH_ENABLED"):
         errors.append("legacy publishing cannot be enabled in production")
     return PreflightResult(not errors, "health-only" if health_only else "service", tuple(errors))

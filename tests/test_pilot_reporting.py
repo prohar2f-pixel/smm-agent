@@ -26,7 +26,7 @@ class PilotReportingTests(unittest.TestCase):
     def _seed(self):
         with sqlite3.connect(self.path) as c:
             c.execute("PRAGMA foreign_keys=ON")
-            c.execute("INSERT INTO pilot_passports(id,name,status,timezone,evaluation_mode,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", ("pilot","Pilot","observing","UTC","internal_efficiency",NOW,NOW))
+            c.execute("INSERT INTO pilot_passports(id,name,status,timezone,evaluation_mode,target_count,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", ("pilot","Pilot","observing","UTC","internal_efficiency",1,NOW,NOW))
             c.execute("INSERT INTO content_projects(id,pilot_id,title,status,owner_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", ("project","pilot","Demo","observing","owner",NOW,NOW))
             c.execute("INSERT INTO content_briefs(id,project_id,brief_no,audience,goal,offer,angle,cta_text,platform,target_ref,duration_min_sec,duration_max_sec,constraints_json,prompt_version,content_sha256,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("brief","project",1,"a","g","o","x","cta","tg","target",30,45,"[]","1.0.0","b"*64,"owner",NOW))
             c.execute("INSERT INTO content_revisions(id,project_id,brief_id,revision_no,script_text,caption_text,timeline_json,prompt_versions_json,content_sha256,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", ("revision","project","brief",1,"s","c","[]","{}","c"*64,"owner",NOW))
@@ -38,7 +38,7 @@ class PilotReportingTests(unittest.TestCase):
     def test_missing_windows_and_partial_costs_are_explicit(self):
         report = PilotReportBuilder(self.repo).build("pilot")
         self.assertEqual(report.decision, "insufficient_data")
-        self.assertIn("24h, 72h, 7d", report.markdown)
+        self.assertIn("job:24h, job:72h, job:7d", report.markdown)
         self.assertIn("частичные", report.markdown)
 
     def test_measured_zero_is_not_missing_and_20_percent_target_is_success(self):
@@ -55,6 +55,25 @@ class PilotReportingTests(unittest.TestCase):
         for window in ("24h", "72h", "7d"):
             self.measure.add_metric(snapshot_id=window, publish_job_id="job", window=window, metric_name="views", value=1, measured=True, definition="views", source="api", captured_at=NOW, created_at=NOW)
         self.assertEqual(PilotReportBuilder(self.repo).build("pilot").decision, "insufficient_data")
+
+    def test_each_published_job_needs_every_window_and_measured_null_is_rejected(self):
+        with sqlite3.connect(self.path) as c:
+            c.execute("UPDATE pilot_passports SET target_count=2 WHERE id='pilot'")
+            c.execute("INSERT INTO publish_packages(id,project_id,revision_id,package_sha256,caption_text,assets_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)", ("pkg2","project","revision","e"*64,"caption2","[]","owner",NOW))
+            c.execute("INSERT INTO publish_jobs(id,package_id,platform,target_ref,status,external_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", ("job2","pkg2","telegram","target2","published","post2",NOW,NOW))
+            with self.assertRaises(sqlite3.IntegrityError):
+                c.execute("INSERT INTO metric_snapshots(id,publish_job_id,window,metric_name,value_numeric,is_measured,definition,source,captured_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", ("bad","job","24h","views",None,1,"views","api",NOW,NOW))
+        for job in ("job", "job2"):
+            for window in ("24h", "72h", "7d"):
+                if job == "job2" and window == "7d":
+                    continue
+                self.measure.add_metric(snapshot_id=f"{job}-{window}", publish_job_id=job,
+                                        window=window, metric_name="views", value=1,
+                                        measured=True, definition="views", source="api",
+                                        captured_at=NOW, created_at=NOW)
+        report = PilotReportBuilder(self.repo).build("pilot")
+        self.assertEqual(report.decision, "insufficient_data")
+        self.assertIn("job2:7d", report.markdown)
 
 
 if __name__ == "__main__":

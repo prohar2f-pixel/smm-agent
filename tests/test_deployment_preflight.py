@@ -17,7 +17,9 @@ class DeploymentPreflightTests(unittest.TestCase):
                 "FACTORY_CONTROL_PLANE_ENABLED":"true",
                 "FACTORY_WORKER_ENABLED":"true",
                 "FACTORY_PUBLISHING_ENABLED":"false",
-                "FACTORY_PAID_GENERATION_ENABLED":"false"}
+                "FACTORY_PAID_GENERATION_ENABLED":"false",
+                "FACTORY_PILOT_ID":"pilot", "FACTORY_ARTIFACT_ROOT":"/data/artifacts",
+                "FACTORY_BACKUP_DIR":"/data/backups"}
 
     def test_missing_placeholder_and_unsafe_flag_combinations_fail(self):
         self.assertFalse(validate_environment({}).ok)
@@ -46,7 +48,7 @@ class DeploymentPreflightTests(unittest.TestCase):
             self.assertIn("pilot is not active", errors)
             drill = backup_restore_drill(path, Path(directory))
             self.assertEqual(drill["integrity"], "ok")
-            self.assertEqual(drill["versions"], list(range(1,10)))
+            self.assertEqual(drill["versions"], list(range(1,11)))
 
 
 if __name__ == "__main__":
