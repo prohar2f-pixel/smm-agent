@@ -6,11 +6,14 @@ import hashlib
 import json
 import mimetypes
 import os
+import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from db.content_repository import ContentRepository
+from domain.artifact_integrity import verified_asset_path
 from domain.errors import ConflictError, NotFoundError
 from domain.job_service import JobService
 from domain.production_models import WorkerReportRecord
@@ -20,6 +23,7 @@ from workers.contracts import WorkerReport
 @dataclass(frozen=True)
 class VerifiedArtifact:
     path: Path
+    storage_key: str
     sha256: str
     size_bytes: int
     mime_type: str
@@ -70,7 +74,31 @@ class ArtifactVerifier:
             required = expected.get(key)
             if required is not None and (mime if key == "mime_type" else metadata.get(key)) != required:
                 raise ConflictError(f"artifact {key} mismatch")
-        return VerifiedArtifact(resolved, actual_hash, size, mime or "application/octet-stream",
+        accepted = self.root / ".accepted"
+        accepted.mkdir(mode=0o700, exist_ok=True)
+        destination = accepted / actual_hash
+        if not destination.exists():
+            with tempfile.NamedTemporaryFile(dir=accepted, delete=False) as temporary:
+                temporary_path = Path(temporary.name)
+                with resolved.open("rb") as source:
+                    shutil.copyfileobj(source, temporary)
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            try:
+                verified_asset_path(
+                    self.root, temporary_path.relative_to(self.root).as_posix(), actual_hash,
+                )
+                try:
+                    os.link(temporary_path, destination)
+                except FileExistsError:
+                    pass
+            finally:
+                temporary_path.unlink(missing_ok=True)
+        storage_key = destination.relative_to(self.root).as_posix()
+        verified_asset_path(self.root, storage_key, actual_hash)
+        destination.chmod(0o444)
+        return VerifiedArtifact(destination, storage_key, actual_hash, size,
+                                mime or "application/octet-stream",
                                 metadata.get("duration_ms"), metadata.get("width"),
                                 metadata.get("height"))
 
@@ -122,10 +150,10 @@ class WorkerReportService:
                     rights_status,privacy_status,created_at)
                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (asset_id, job["project_id"], job["revision_id"],
-                     payload.get("asset_role", "preview"), report.output_path,
+                     payload.get("asset_role", "preview"), artifact.storage_key,
                      artifact.sha256, artifact.mime_type, artifact.size_bytes,
                      artifact.duration_ms, artifact.width, artifact.height, report.job_id,
-                     "allowed", "clear", report.created_at),
+                     "pending", "pending", report.created_at),
                 )
             qa = dict(report.machine_qa)
             qa["_fingerprint"] = fingerprint

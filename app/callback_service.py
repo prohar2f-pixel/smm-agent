@@ -8,7 +8,14 @@ import secrets
 
 from db.content_repository import ContentRepository
 from domain.errors import ConflictError, ValidationError
-from domain.approval_service import ApprovalService
+from domain.approval_service import ApprovalService, ROLE_BY_STAGE
+from domain.time_utils import is_after
+
+
+DECISION_STATUS_BY_ACTION = {
+    "approve": "approved", "changes_requested": "changes_requested",
+    "reject": "rejected", "invalidate": "invalidated",
+}
 
 
 class CallbackService:
@@ -18,6 +25,14 @@ class CallbackService:
     def issue(self, *, user_id: str, chat_id: str, action: str, subject_id: str,
               row_version: int, subject_sha256: str, expires_at: str,
               created_at: str) -> str:
+        try:
+            stage, verb = action.split(":", 1)
+        except ValueError as exc:
+            raise ValidationError("callback action must bind stage and decision") from exc
+        if (stage not in ROLE_BY_STAGE or verb not in DECISION_STATUS_BY_ACTION
+                or not is_after(expires_at, created_at,
+                                left_field="expires_at", right_field="created_at")):
+            raise ValidationError("invalid callback action or expiry")
         token = secrets.token_urlsafe(24)
         with self.repository.transaction() as connection:
             connection.execute(
@@ -48,7 +63,8 @@ class CallbackService:
             ).fetchone()
             if row is None or row["consumed_at"] is not None:
                 raise ConflictError("callback is invalid or already consumed")
-            if row["expires_at"] < now:
+            if not is_after(row["expires_at"], now,
+                            left_field="expires_at", right_field="current time"):
                 raise ConflictError("callback expired")
             if (row["user_id"] != user_id or row["chat_id"] != chat_id
                     or row["subject_sha256"] != subject_sha256
@@ -91,13 +107,24 @@ class CallbackService:
             ).fetchone()
             if action is None or action["consumed_at"] is not None:
                 raise ConflictError("callback is invalid or already consumed")
-            if action["expires_at"] < now:
+            if not is_after(action["expires_at"], now,
+                            left_field="expires_at", right_field="current time"):
                 raise ConflictError("callback expired")
             if (action["user_id"] != user_id or action["chat_id"] != chat_id
                     or action["subject_sha256"] != subject_sha256
                     or action["expected_row_version"] != row_version):
                 raise ValidationError("callback scope mismatch")
-            if decision.get("actor_id") != user_id or decision.get("subject_sha256") != subject_sha256:
+            try:
+                expected_stage, verb = action["action"].split(":", 1)
+            except ValueError as exc:
+                raise ValidationError("callback action is not stage-bound") from exc
+            expected_status = DECISION_STATUS_BY_ACTION.get(verb)
+            if expected_status is None or decision.get("stage") != expected_stage:
+                raise ValidationError("callback action cannot create a decision")
+            if (decision.get("actor_id") != user_id
+                    or decision.get("subject_sha256") != subject_sha256
+                    or decision.get("revision_id") != action["subject_id"]
+                    or decision.get("status") != expected_status):
                 raise ValidationError("decision does not match callback authority")
             result = approval_service.decide_in_transaction(connection, **decision)
             result_ref = f"approval:{result['id']}"

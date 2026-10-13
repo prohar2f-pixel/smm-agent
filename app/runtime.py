@@ -12,6 +12,7 @@ from deployment.preflight import validate_pilot
 from domain.errors import ValidationError
 from domain.job_service import JobService
 from domain.publish_service import PublishService
+from domain.text_factory import TextFactory
 from workers.runner import WorkerRunner
 
 
@@ -75,6 +76,12 @@ class FactoryRuntime:
     def publish_service(self) -> PublishService:
         return PublishService(
             self.repository, publishing_enabled=self.config.publishing_enabled,
+            artifact_root=self.config.artifact_root,
+        )
+
+    def text_factory(self, gateway) -> TextFactory:
+        return TextFactory(
+            self.repository, gateway, enabled=self.config.paid_generation_enabled,
         )
 
     def worker_runner(self, handlers: dict) -> WorkerRunner:

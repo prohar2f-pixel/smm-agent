@@ -12,6 +12,7 @@ from domain.publish_service import PublishService
 
 NOW = "2026-10-13T12:00:00+00:00"
 LATER = "2026-10-13T12:05:00+00:00"
+EARLIER = "2026-10-13T11:00:00+00:00"
 HASH = "a" * 64
 
 
@@ -90,8 +91,41 @@ class ApprovalCallbackTests(unittest.TestCase):
                 target_ref="channel",
             )
 
+    def test_render_approval_requires_qa_for_the_exact_asset(self):
+        with sqlite3.connect(self.path) as c:
+            for asset_id, digest in (("preview-a", "d" * 64), ("preview-b", "e" * 64)):
+                c.execute(
+                    "INSERT INTO assets(id,project_id,revision_id,role,storage_key,sha256,mime_type,size_bytes,rights_status,privacy_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (asset_id, "project", "revision", "preview", f"{asset_id}.mp4",
+                     digest, "video/mp4", 1, "pending", "pending", NOW),
+                )
+            c.execute(
+                "INSERT INTO qa_results(id,project_id,revision_id,asset_id,stage,check_code,status,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("qa-a", "project", "revision", "preview-a", "technical", "media",
+                 "pass", "worker", NOW),
+            )
+        with self.assertRaises(ValidationError):
+            self.approvals.decide(
+                decision_id="preview-with-old-qa", project_id="project",
+                revision_id="revision", stage="preview", subject_sha256="e" * 64,
+                status="approved", actor_id="u", actor_role="reviewer",
+                checklist_version="1", created_at=NOW,
+            )
+        with sqlite3.connect(self.path) as c:
+            c.execute(
+                "INSERT INTO qa_results(id,project_id,revision_id,asset_id,stage,check_code,status,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("qa-b", "project", "revision", "preview-b", "technical", "media",
+                 "pass", "worker", NOW),
+            )
+        row = self.approvals.decide(
+            decision_id="preview-exact", project_id="project", revision_id="revision",
+            stage="preview", subject_sha256="e" * 64, status="approved",
+            actor_id="u", actor_role="reviewer", checklist_version="1", created_at=NOW,
+        )
+        self.assertEqual(row["status"], "approved")
+
     def test_callback_deduplicates_update_and_blocks_replay_scope_and_expiry(self):
-        token = self.callbacks.issue(user_id="u", chat_id="c", action="approve", subject_id="revision", row_version=1, subject_sha256=HASH, expires_at=LATER, created_at=NOW)
+        token = self.callbacks.issue(user_id="u", chat_id="c", action="script:approve", subject_id="revision", row_version=1, subject_sha256=HASH, expires_at=LATER, created_at=NOW)
         first = self.callbacks.consume(producer="telegram", event_id="e1", token=token, user_id="u", chat_id="c", subject_sha256=HASH, row_version=1, now=NOW)
         self.assertEqual(first, self.callbacks.consume(producer="telegram", event_id="e1", token=token, user_id="u", chat_id="c", subject_sha256=HASH, row_version=1, now=NOW))
         with self.assertRaises(ConflictError):
@@ -100,12 +134,12 @@ class ApprovalCallbackTests(unittest.TestCase):
                                    subject_sha256=HASH, row_version=1, now=NOW)
         with self.assertRaises(ConflictError):
             self.callbacks.consume(producer="telegram", event_id="e2", token=token, user_id="u", chat_id="c", subject_sha256=HASH, row_version=1, now=NOW)
-        expired = self.callbacks.issue(user_id="u", chat_id="c", action="approve", subject_id="revision", row_version=1, subject_sha256=HASH, expires_at=NOW, created_at=NOW)
+        expired = self.callbacks.issue(user_id="u", chat_id="c", action="script:approve", subject_id="revision", row_version=1, subject_sha256=HASH, expires_at=NOW, created_at=EARLIER)
         with self.assertRaises(ConflictError):
             self.callbacks.consume(producer="telegram", event_id="e3", token=expired, user_id="u", chat_id="c", subject_sha256=HASH, row_version=1, now=LATER)
 
     def test_callback_decision_audit_and_outbox_commit_atomically(self):
-        token = self.callbacks.issue(user_id="u", chat_id="c", action="approve",
+        token = self.callbacks.issue(user_id="u", chat_id="c", action="script:approve",
                                      subject_id="revision", row_version=1,
                                      subject_sha256=HASH, expires_at=LATER,
                                      created_at=NOW)
@@ -138,6 +172,38 @@ class ApprovalCallbackTests(unittest.TestCase):
             self.assertEqual(c.execute("SELECT COUNT(*) FROM approval_decisions WHERE id='atomic'").fetchone()[0], 1)
             self.assertEqual(c.execute("SELECT COUNT(*) FROM audit_events WHERE correlation_id='corr'").fetchone()[0], 1)
             self.assertEqual(c.execute("SELECT COUNT(*) FROM outbox_events WHERE aggregate_id='atomic'").fetchone()[0], 1)
+
+    def test_callback_binds_action_and_subject_to_decision(self):
+        token = self.callbacks.issue(
+            user_id="u", chat_id="c", action="script:reject", subject_id="revision",
+            row_version=1, subject_sha256=HASH, expires_at=LATER, created_at=NOW,
+        )
+        base = dict(
+            decision_id="bound", project_id="project", revision_id="revision",
+            stage="script", subject_sha256=HASH, status="approved", actor_id="u",
+            actor_role="reviewer", checklist_version="1", created_at=NOW,
+        )
+        with self.assertRaises(ValidationError):
+            self.callbacks.consume_and_decide(
+                approval_service=self.approvals, producer="telegram", event_id="reject-as-approve",
+                token=token, user_id="u", chat_id="c", subject_sha256=HASH,
+                row_version=1, now=NOW, decision=base, correlation_id="corr",
+            )
+        with self.assertRaises(ValidationError):
+            self.callbacks.consume_and_decide(
+                approval_service=self.approvals, producer="telegram", event_id="wrong-subject",
+                token=token, user_id="u", chat_id="c", subject_sha256=HASH,
+                row_version=1, now=NOW,
+                decision=dict(base, status="rejected", revision_id="other"),
+                correlation_id="corr",
+            )
+        result = self.callbacks.consume_and_decide(
+            approval_service=self.approvals, producer="telegram", event_id="bound-reject",
+            token=token, user_id="u", chat_id="c", subject_sha256=HASH,
+            row_version=1, now=NOW, decision=dict(base, status="rejected"),
+            correlation_id="corr",
+        )
+        self.assertEqual(result, "approval:bound")
 
 
 if __name__ == "__main__":

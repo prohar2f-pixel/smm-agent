@@ -8,14 +8,18 @@ import sqlite3
 
 from db.content_repository import ContentRepository
 from domain.errors import ConflictError, NotFoundError, ValidationError
+from domain.artifact_integrity import verified_asset_path
 from domain.package_hash import canonical_package_hash
+from domain.time_utils import parse_instant
 from publishing.base import DefinitivePublishError, PublishRequest, PublisherAdapter, PublishResult
 
 
 class PublishService:
-    def __init__(self, repository: ContentRepository, *, publishing_enabled: bool = False):
+    def __init__(self, repository: ContentRepository, *, publishing_enabled: bool = False,
+                 artifact_root=None):
         self.repository = repository
         self.publishing_enabled = publishing_enabled
+        self.artifact_root = artifact_root
 
     @staticmethod
     def package_hash(caption_text: str, assets_json: str) -> str:
@@ -35,7 +39,8 @@ class PublishService:
             approval = self._latest_approval(connection, package, platform, target_ref)
             if (approval is None or approval["status"] != "approved"
                     or approval["expires_at"] is None
-                    or approval["expires_at"] < created_at):
+                    or parse_instant(approval["expires_at"], "expires_at")
+                    <= parse_instant(created_at, "created_at")):
                 raise ValidationError("exact publish approval is required")
             status = "awaiting_manual" if platform == "manual" else "queued"
             try:
@@ -58,12 +63,22 @@ class PublishService:
     def execute(self, job_id: str, adapter: PublisherAdapter, at: str):
         if not self.publishing_enabled:
             raise ValidationError("publishing feature is disabled")
+        if self.artifact_root is None:
+            raise ValidationError("publishing requires an artifact root")
         with self.repository.transaction() as connection:
             row = self._load_ready(connection, job_id, at)
             if row["status"] == "published":
                 return row
             if row["status"] not in ("queued", "failed"):
                 raise ConflictError(f"publish job cannot send from {row['status']}")
+            if adapter.platform != row["platform"]:
+                raise ValidationError("publisher adapter does not match job platform")
+            assets = connection.execute(
+                """SELECT a.storage_key,a.sha256 FROM assets a
+                JOIN json_each(?) item ON item.value=a.id""", (row["assets_json"],),
+            ).fetchall()
+            for asset in assets:
+                verified_asset_path(self.artifact_root, asset["storage_key"], asset["sha256"])
             attempt_no = connection.execute(
                 "SELECT COUNT(*) FROM publish_attempts WHERE publish_job_id=?", (job_id,),
             ).fetchone()[0] + 1
@@ -108,12 +123,21 @@ class PublishService:
     def reconcile(self, job_id: str, adapter: PublisherAdapter, at: str):
         with self.repository.transaction() as connection:
             row = connection.execute(
-                """SELECT pa.* FROM publish_attempts pa JOIN publish_jobs pj
-                ON pj.id=pa.publish_job_id WHERE pj.id=? AND pj.status='unknown_outcome'
+                """SELECT pa.*,o.provider_key FROM publish_attempts pa JOIN publish_jobs pj
+                ON pj.id=pa.publish_job_id
+                LEFT JOIN external_operations o ON o.id=pa.operation_id
+                WHERE pj.id=? AND pj.status='unknown_outcome'
                 ORDER BY pa.attempt_no DESC LIMIT 1""", (job_id,),
             ).fetchone()
             if row is None:
                 raise ConflictError("publish job is not awaiting reconciliation")
+            job = connection.execute(
+                "SELECT platform FROM publish_jobs WHERE id=?", (job_id,),
+            ).fetchone()
+            if (job is None or adapter.platform != job["platform"]
+                    or (row["provider_key"] is not None
+                        and adapter.provider_key != row["provider_key"])):
+                raise ValidationError("publisher adapter does not match job platform")
             key = row["idempotency_key"]
         result = adapter.reconcile(key)
         if result is None:
@@ -145,17 +169,21 @@ class PublishService:
             if attempt.rowcount != 1 or job.rowcount != 1:
                 raise ConflictError("publish reconciliation lost state race")
             if current["operation_id"]:
-                connection.execute(
+                operation_update = connection.execute(
                     """UPDATE external_operations SET status='reconciled',billing_status='no_charge',
                     external_id=?,result_sha256=?,error_code=NULL,updated_at=?,
                     row_version=row_version+1 WHERE id=? AND status='unknown_outcome'""",
                     (result.external_id, result_hash, at, current["operation_id"]),
                 )
+                if operation_update.rowcount != 1:
+                    raise ConflictError("external operation reconciliation lost state race")
         return self.get(job_id)
 
     def confirm_manual(self, job_id: str, external_id: str, evidence_ref: str, at: str):
         if not self.publishing_enabled:
             raise ValidationError("publishing feature is disabled")
+        if self.artifact_root is None:
+            raise ValidationError("publishing requires an artifact root")
         if not external_id or not evidence_ref:
             raise ValidationError("manual publication requires external id and evidence")
         with self.repository.transaction() as connection:
@@ -202,14 +230,17 @@ class PublishService:
             connection, row, row["platform"], row["target_ref"])
         if (latest is None or latest["status"] != "approved"
                 or latest["id"] != row["approval_id"]
-                or latest["expires_at"] is None or latest["expires_at"] < at
+                or latest["expires_at"] is None
+                or parse_instant(latest["expires_at"], "expires_at")
+                <= parse_instant(at, "current time")
                 or project is None or project["current_revision_id"] != row["revision_id"]
                 or row["approval_status"] != "approved"
                 or row["approved_hash"] != row["package_sha256"]
                 or row["approved_target"] != row["target_ref"]):
             raise ValidationError("publish approval is missing or stale")
+        asset_ids = json.loads(row["assets_json"])
         final = connection.execute(
-            """SELECT ad.status FROM approval_decisions ad JOIN assets a
+            """SELECT ad.status,a.id AS asset_id FROM approval_decisions ad JOIN assets a
             ON a.sha256=ad.subject_sha256 AND a.project_id=ad.project_id
             AND a.revision_id=ad.revision_id AND a.role='master'
             WHERE ad.project_id=? AND ad.revision_id=? AND ad.stage='final'
@@ -218,6 +249,8 @@ class PublishService:
         ).fetchone()
         if final is None or final["status"] != "approved":
             raise ValidationError("current final approval is required")
+        if final["asset_id"] not in asset_ids:
+            raise ValidationError("package does not contain the approved master")
         bad_source = connection.execute(
             """SELECT 1 FROM content_project_sources cps JOIN sources s ON s.id=cps.source_id
             WHERE cps.project_id=? AND (s.rights_status!='allowed' OR s.privacy_status!='clear')
@@ -225,7 +258,6 @@ class PublishService:
         ).fetchone()
         if bad_source:
             raise ValidationError("source rights or privacy no longer permit publication")
-        asset_ids = json.loads(row["assets_json"])
         if asset_ids:
             placeholders = ",".join("?" for _ in asset_ids)
             valid_count = connection.execute(
@@ -293,11 +325,13 @@ class PublishService:
             if operation and operation["operation_id"]:
                 op_status = "succeeded" if result else ("failed" if attempt_status == "failed" else "unknown_outcome")
                 billing = "no_charge" if op_status in ("succeeded", "failed") else "unknown"
-                connection.execute(
+                operation_update = connection.execute(
                     """UPDATE external_operations SET status=?,billing_status=?,external_id=?,
                     result_sha256=?,error_code=?,updated_at=?,row_version=row_version+1
                     WHERE id=? AND status IN ('submitting','unknown_outcome')""",
                     (op_status, billing, result.external_id if result else None,
                      result_hash, error_code, at, operation["operation_id"]),
                 )
+                if operation_update.rowcount != 1:
+                    raise ConflictError("external operation settlement lost state race")
             return connection.execute("SELECT * FROM publish_jobs WHERE id=?", (job_id,)).fetchone()

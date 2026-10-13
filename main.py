@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from safe_logging import configure_safe_logging
 
@@ -33,6 +33,10 @@ async def main():
         while True:
             now = datetime.now(timezone.utc).isoformat()
             await asyncio.to_thread(worker_runner.recover, now)
+            lease_until = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+            await asyncio.to_thread(
+                worker_runner.run_once, "content-factory-main", now, lease_until,
+            )
             await asyncio.sleep(30)
 
     worker_task = (asyncio.create_task(recover_worker_leases())
@@ -64,6 +68,7 @@ async def main():
     if config.control_plane_enabled:
         commands.extend([
             BotCommand(command="factory_status", description="Статус контент-завода"),
+            BotCommand(command="factory_pilot", description="Готовность пилота"),
             BotCommand(command="factory_queue", description="Очередь контент-завода"),
             BotCommand(command="factory_reconcile", description="Сверка неизвестного результата"),
             BotCommand(command="factory_report", description="Отчёт пилота"),

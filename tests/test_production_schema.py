@@ -24,7 +24,7 @@ class ProductionSchemaTests(unittest.TestCase):
         return connection
 
     def test_migration_chain_reaches_version_seven(self):
-        self.assertEqual(run_migrations(self.path), list(range(1, 11)))
+        self.assertEqual(run_migrations(self.path), list(range(1, 12)))
 
     def test_production_tables_exist(self):
         run_migrations(self.path)
@@ -96,6 +96,30 @@ class ProductionSchemaTests(unittest.TestCase):
                 columns = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
                 self.assertIn("created_at", columns, table)
                 self.assertNotIn("updated_at", columns, table)
+
+    def test_revision_approval_and_asset_identity_are_database_immutable(self):
+        run_migrations(self.path)
+        with self.connect() as connection:
+            self._seed_project(connection)
+            connection.execute(
+                "INSERT INTO assets(id,project_id,revision_id,role,storage_key,sha256,mime_type,size_bytes,rights_status,privacy_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                ("asset", "project", "revision", "master", "master.mp4", HASH,
+                 "video/mp4", 1, "pending", "pending", NOW),
+            )
+            connection.execute(
+                "INSERT INTO approval_decisions(id,project_id,revision_id,stage,subject_sha256,status,actor_id,actor_role,checklist_version,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                ("approval", "project", "revision", "final", HASH, "approved",
+                 "owner", "owner", "1", NOW),
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute("UPDATE content_revisions SET script_text='changed' WHERE id='revision'")
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute("UPDATE approval_decisions SET status='rejected' WHERE id='approval'")
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute("UPDATE assets SET sha256=? WHERE id='asset'", ("f" * 64,))
+            connection.execute(
+                "UPDATE assets SET rights_status='allowed',privacy_status='clear' WHERE id='asset'"
+            )
 
     @staticmethod
     def _seed_project(connection):

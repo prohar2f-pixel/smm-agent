@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 
 from db.content_repository import ContentRepository
@@ -43,15 +44,30 @@ class PilotReportBuilder:
             WHERE cp.pilot_id=? ORDER BY ms.publish_job_id,ms.window,ms.metric_name""",
             (pilot_id,),
         )
+        try:
+            thresholds = json.loads(pilot["thresholds_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            thresholds = {}
+        required_metrics = thresholds.get("required_metrics", [])
+        if (not isinstance(required_metrics, list) or not required_metrics
+                or any(not isinstance(name, str) or not name for name in required_metrics)):
+            required_metrics = []
         active = sum(row["active_sec"] for row in times)
-        labor_known = all(row["rate_minor_per_hour"] is not None for row in times)
-        labor_cost = sum(round(row["active_sec"] * row["rate_minor_per_hour"] / 3600)
-                         for row in times if row["rate_minor_per_hour"] is not None)
+        labor_known = bool(times) and all(
+            row["rate_minor_per_hour"] is not None and row["currency"] is not None
+            for row in times
+        )
+        labor_costs = {}
+        for entry in times:
+            if entry["rate_minor_per_hour"] is not None and entry["currency"] is not None:
+                amount = round(entry["active_sec"] * entry["rate_minor_per_hour"] / 3600)
+                labor_costs[entry["currency"]] = labor_costs.get(entry["currency"], 0) + amount
         published = [row for row in jobs if row["status"] == "published"]
-        measured = {(row["publish_job_id"], row["window"])
+        measured = {(row["publish_job_id"], row["window"], row["metric_name"])
                     for row in snapshots if row["is_measured"]}
-        missing = [f"{job['id']}:{window}" for job in published
-                   for window in self.WINDOWS if (job["id"], window) not in measured]
+        missing = [f"{job['id']}:{window}:{metric}" for job in published
+                   for window in self.WINDOWS for metric in required_metrics
+                   if (job["id"], window, metric) not in measured]
         unresolved_operations = self.repository.fetchall(
             """SELECT o.id FROM external_operations o WHERE o.pilot_id=?
             AND (o.status IN ('submitting','unknown_outcome')
@@ -68,13 +84,15 @@ class PilotReportBuilder:
             JOIN external_operations o ON o.id=ce.operation_id WHERE o.pilot_id=?
             ORDER BY ce.occurred_at,ce.id""", (pilot_id,),
         )
-        provider_cost = sum((-row["amount_minor"] if row["kind"] == "refund"
-                             else row["amount_minor"]) for row in cost_rows)
-        cost_currencies = sorted({row["currency"] for row in cost_rows})
+        provider_costs = {}
+        for cost in cost_rows:
+            signed = -cost["amount_minor"] if cost["kind"] == "refund" else cost["amount_minor"]
+            provider_costs[cost["currency"]] = provider_costs.get(cost["currency"], 0) + signed
         reduction = None
         if baseline and baseline["duration_sec"]:
             reduction = 1 - active / baseline["duration_sec"]
-        sufficient = (len(published) >= pilot["target_count"] and not missing
+        sufficient = (bool(times) and active > 0 and labor_known and bool(required_metrics)
+                      and len(published) >= pilot["target_count"] and not missing
                       and not unknown and baseline is not None)
         success = sufficient and reduction is not None and reduction >= 0.20
         decision = "insufficient_data" if not sufficient else ("success" if success else "failure")
@@ -88,8 +106,16 @@ class PilotReportBuilder:
             f"- Активное время: {active} сек.",
             f"- Базовое время: {baseline['duration_sec'] if baseline else 'нет данных'} сек.",
             f"- Снижение времени: {round(reduction * 100, 2) if reduction is not None else 'нет данных'}%.",
-            f"- Трудозатраты: {labor_cost} minor units ({'полные' if labor_known else 'частичные'}).",
-            f"- Внешние затраты: {provider_cost} minor units ({','.join(cost_currencies) if cost_currencies else 'нет списаний'}).",
+            "- Трудозатраты: " + (
+                ", ".join(f"{amount} {currency} minor units"
+                          for currency, amount in sorted(labor_costs.items()))
+                if labor_costs else "нет данных"
+            ) + f" ({'полные' if labor_known else 'частичные'}).",
+            "- Внешние затраты: " + (
+                ", ".join(f"{amount} {currency} minor units"
+                          for currency, amount in sorted(provider_costs.items()))
+                if provider_costs else "нет списаний"
+            ) + ".",
             "", "## Метрики", "", *metric_lines, "",
             f"- Отсутствующие окна: {', '.join(missing) if missing else 'нет'}.",
             f"- Опубликовано: {len(published)} из {pilot['target_count']}.",

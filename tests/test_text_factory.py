@@ -68,7 +68,7 @@ class TextFactoryTests(unittest.TestCase):
             c.execute("INSERT INTO reviews(id,project_id,revision_id,stage,subject_sha256,assigned_to,status,decision_by,decision_at,checklist_json,created_at,checklist_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", ("review","project","revision","script","c"*64,"reviewer","approved","reviewer",NOW,"{}",NOW,"1"))
             c.execute("UPDATE content_projects SET current_brief_id='brief',current_revision_id='revision' WHERE id='project'")
         self.ideas = IdeaService(self.repo)
-        self.ideas.capture(idea_id="idea", pilot_id="pilot", source_id="source", angle="angle", role="education", proof_summary="proof", format="post", created_at=NOW)
+        self.ideas.capture(idea_id="idea", pilot_id="pilot", source_id="source", angle="angle", role="education", proof_summary="proof", format="post", created_at=NOW, project_id="project")
         readiness = ReadinessService(self.repo)
         budgets = BudgetService(self.repo, readiness)
         for scope, ref in {"operation":"llm", "project":"project", "pilot":"pilot",
@@ -122,7 +122,7 @@ class TextFactoryTests(unittest.TestCase):
     def test_feature_gate_and_timeout_fail_without_output(self):
         self.ideas.score("idea", {"relevance":3,"proof":3,"novelty":2,"fit":3,"effort":1}, rubric_version="1", evidence={}, at=NOW)
         with self.assertRaises(ValidationError):
-            asyncio.run(self.generate("disabled", FakeTransport(), feature_enabled=False))
+            asyncio.run(self.generate("disabled", FakeTransport(), enabled=False))
         transport = FakeTransport(TimeoutError("timeout"))
         with self.assertRaises(ReconciliationRequiredError):
             asyncio.run(self.generate("unknown", transport, command_id="unknown-run"))
@@ -131,12 +131,24 @@ class TextFactoryTests(unittest.TestCase):
             asyncio.run(self.generate("unknown", transport, command_id="unknown-run"))
         self.assertEqual(len(transport.calls), 1)
 
-    def generate(self, output_id, transport, *, feature_enabled=True, command_id="text-run"):
-        return TextFactory(self.repo, self.gateway).generate(
+    def test_budget_context_must_match_idea_project_and_revision(self):
+        self.ideas.score("idea", {"relevance":3,"proof":3,"novelty":2,"fit":3,"effort":1}, rubric_version="1", evidence={}, at=NOW)
+        wrong_project = BudgetContext("pilot", "other-project", "revision", "llm",
+                                      "2026-10-13", "2026-10")
+        with self.assertRaises(ValidationError):
+            asyncio.run(TextFactory(self.repo, self.gateway, enabled=True).generate(
+                output_id="wrong", command_id="wrong-run", idea_id="idea",
+                created_by="u", created_at=NOW, prompt_version="1.0.0",
+                model="safe-model", budget_context=wrong_project,
+                upper_bound_minor=1000, currency="RUB", transport=FakeTransport(),
+            ))
+
+    def generate(self, output_id, transport, *, enabled=True, command_id="text-run"):
+        return TextFactory(self.repo, self.gateway, enabled=enabled).generate(
             output_id=output_id, command_id=command_id, idea_id="idea",
             created_by="u", created_at=NOW, prompt_version="1.0.0",
             model="safe-model", budget_context=self.context, upper_bound_minor=1000,
-            currency="RUB", transport=transport, feature_enabled=feature_enabled,
+            currency="RUB", transport=transport,
         )
 
 

@@ -8,6 +8,7 @@ import sqlite3
 from db.content_repository import ContentRepository
 from domain.errors import ConflictError, NotFoundError, ValidationError
 from domain.package_hash import canonical_package_hash
+from domain.time_utils import canonical_instant, is_after
 
 ROLE_BY_STAGE = {
     "script": {"owner", "reviewer"}, "preview": {"owner", "reviewer"},
@@ -31,6 +32,8 @@ class ApprovalService:
                               created_at: str, target_ref: str | None = None,
                               platform: str | None = None, reason: str | None = None,
                               expires_at: str | None = None):
+        created_at = canonical_instant(created_at, "created_at")
+        expires_at = canonical_instant(expires_at, "expires_at") if expires_at else None
         if stage not in ROLE_BY_STAGE:
             raise ValidationError("unknown approval stage")
         if status not in ("approved", "changes_requested", "rejected", "invalidated"):
@@ -57,7 +60,7 @@ class ApprovalService:
         if stage in ("preview", "final", "animatic"):
             role = "preview" if stage in ("preview", "animatic") else "master"
             asset = connection.execute(
-                """SELECT sha256 FROM assets WHERE project_id=? AND revision_id=?
+                """SELECT id,sha256 FROM assets WHERE project_id=? AND revision_id=?
                 AND role=? ORDER BY created_at DESC,id DESC LIMIT 1""",
                 (project_id, revision_id, role),
             ).fetchone()
@@ -66,14 +69,17 @@ class ApprovalService:
             expected = asset["sha256"]
             results = connection.execute(
                 """SELECT status FROM qa_results WHERE project_id=? AND revision_id=?
-                AND stage IN ('technical',?)""", (project_id, revision_id, stage),
+                AND asset_id=? AND stage IN ('technical',?)""",
+                (project_id, revision_id, asset["id"], stage),
             ).fetchall()
             if not results or any(row["status"] != "pass" for row in results):
                 raise ValidationError("positive QA evidence is required")
         elif stage == "publish":
             if platform not in ("telegram", "vk", "manual") or not target_ref:
                 raise ValidationError("publish approval requires platform and target")
-            if not expires_at or expires_at <= created_at:
+            if not expires_at or not is_after(
+                    expires_at, created_at,
+                    left_field="expires_at", right_field="created_at"):
                 raise ValidationError("publish approval requires a future expiry")
             package = connection.execute(
                 """SELECT package_sha256,caption_text,assets_json FROM publish_packages
@@ -87,7 +93,7 @@ class ApprovalService:
                 raise ConflictError("publish package hash mismatch")
             expected = package["package_sha256"]
             final = connection.execute(
-                """SELECT ad.status FROM approval_decisions ad JOIN assets a
+                """SELECT ad.status,a.id AS asset_id FROM approval_decisions ad JOIN assets a
                 ON a.sha256=ad.subject_sha256 AND a.project_id=ad.project_id
                 AND a.revision_id=ad.revision_id AND a.role='master'
                 WHERE ad.project_id=? AND ad.revision_id=? AND ad.stage='final'
@@ -96,6 +102,8 @@ class ApprovalService:
             ).fetchone()
             if final is None or final["status"] != "approved":
                 raise ValidationError("publish approval requires current final approval")
+            if final["asset_id"] not in json.loads(package["assets_json"]):
+                raise ValidationError("publish package does not contain the approved master")
         if expected != subject_sha256:
             raise ConflictError("approval subject hash is stale")
         try:

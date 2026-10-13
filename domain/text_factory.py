@@ -12,16 +12,18 @@ from llm.gateway import LlmTransport, StructuredLlmGateway
 
 
 class TextFactory:
-    def __init__(self, repository: ContentRepository, gateway: StructuredLlmGateway):
+    def __init__(self, repository: ContentRepository, gateway: StructuredLlmGateway,
+                 *, enabled: bool = False):
         self.repository = repository
         self.gateway = gateway
+        self.enabled = enabled
 
     async def generate(self, *, output_id: str, command_id: str, idea_id: str,
                        created_by: str, created_at: str, prompt_version: str,
                        model: str, budget_context: BudgetContext,
                        upper_bound_minor: int, currency: str,
-                       transport: LlmTransport, feature_enabled: bool):
-        if not feature_enabled:
+                       transport: LlmTransport):
+        if not self.enabled:
             raise ValidationError("text factory feature is disabled")
         existing = self.repository.fetchone(
             "SELECT * FROM text_outputs WHERE id=?", (output_id,),
@@ -41,10 +43,16 @@ class TextFactory:
             raise ValidationError("text generation requires a scored idea")
         if idea["rights_status"] != "allowed" or idea["privacy_status"] != "clear":
             raise ValidationError("source is not usable")
+        revision = self.repository.fetchone(
+            "SELECT project_id FROM content_revisions WHERE id=?",
+            (budget_context.revision_id,),
+        ) if budget_context.revision_id else None
         if (budget_context.pilot_id != idea["pilot_id"]
-                or budget_context.project_id is None
-                or budget_context.revision_id is None):
-            raise ValidationError("budget context does not match the idea pilot")
+                or idea["project_id"] is None
+                or budget_context.project_id != idea["project_id"]
+                or revision is None
+                or revision["project_id"] != idea["project_id"]):
+            raise ValidationError("budget context does not match the idea lineage")
         payload = {"idea_id": idea_id, "angle": idea["angle"],
                    "proof_summary": idea["proof_summary"],
                    "source_id": idea["source_id"],

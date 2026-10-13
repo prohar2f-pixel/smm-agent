@@ -58,6 +58,11 @@ class WorkerContractTests(unittest.TestCase):
         second = self.service.accept(self.report(), NOW)
         self.assertEqual((first.id, second.id), ("report", "report"))
         self.assertEqual(self.service.job_service.get("job").status, "succeeded")
+        asset = self.repo.fetchone("SELECT * FROM assets WHERE id='report:asset'")
+        self.assertEqual((asset["rights_status"], asset["privacy_status"]),
+                         ("pending", "pending"))
+        self.assertEqual(asset["storage_key"], f".accepted/{self.output_hash}")
+        self.assertEqual((self.root / asset["storage_key"]).read_bytes(), self.data)
 
     def test_rejects_stale_fence_owner_expiry_or_wrong_input(self):
         for changes in ({"fence_token": 2}, {"worker_id": "other"},

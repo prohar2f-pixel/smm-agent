@@ -28,7 +28,7 @@ class RuntimeFailClosedTests(unittest.TestCase):
             path = Path(directory) / "agent.db"
             config = FactoryConfig.from_env({"DB_PATH":str(path), "ADMIN_TELEGRAM_ID":"1"})
             applied = FactoryRuntime(config).startup()
-            self.assertEqual(applied, list(range(1, 11)))
+            self.assertEqual(applied, list(range(1, 12)))
 
     def test_disabled_worker_claims_nothing_but_can_recover_safely(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -65,8 +65,18 @@ class RuntimeFailClosedTests(unittest.TestCase):
         source = Path("main.py").read_text()
         self.assertIn("runtime.publish_service()", source)
         self.assertIn("runtime.worker_runner({})", source)
+        self.assertIn("worker_runner.run_once", source)
         self.assertIn("if config.control_plane_enabled:", source)
         self.assertIn("dp.include_router(factory_router)", source)
+
+    def test_runtime_owns_text_factory_feature_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = FactoryRuntime(FactoryConfig(
+                db_path=Path(directory) / "agent.db", admin_telegram_id=1,
+                paid_generation_enabled=False,
+            ))
+            factory = runtime.text_factory(object())
+            self.assertFalse(factory.enabled)
 
 
 if __name__ == "__main__":

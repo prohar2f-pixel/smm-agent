@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 import tempfile
 import unittest
@@ -12,13 +13,16 @@ from publishing.base import PublishResult
 NOW = "2026-10-13T12:00:00+00:00"
 LATER = "2026-10-13T13:00:00+00:00"
 HASH = PublishService.package_hash("caption", '["master"]')
-MASTER_HASH = "d" * 64
+MASTER_BYTES = b"master"
+MASTER_HASH = hashlib.sha256(MASTER_BYTES).hexdigest()
 
 
 class FakeAdapter:
+    platform = "telegram"
     provider_key = "fake"
-    def __init__(self, outcome="ok"):
+    def __init__(self, outcome="ok", platform="telegram"):
         self.outcome = outcome
+        self.platform = platform
         self.requests = []
 
     def send(self, request):
@@ -39,7 +43,12 @@ class PublishServiceTests(unittest.TestCase):
         self.path = Path(self.temp.name) / "agent.db"
         run_migrations(self.path)
         self.repo = ContentRepository(self.path)
-        self.service = PublishService(self.repo, publishing_enabled=True)
+        self.artifacts = Path(self.temp.name) / "artifacts"
+        self.artifacts.mkdir()
+        (self.artifacts / "master.mp4").write_bytes(MASTER_BYTES)
+        self.service = PublishService(
+            self.repo, publishing_enabled=True, artifact_root=self.artifacts,
+        )
         self._seed()
 
     def tearDown(self):
@@ -78,7 +87,7 @@ class PublishServiceTests(unittest.TestCase):
         self.service.enqueue(job_id="tg", package_id="pkg", platform="telegram", target_ref="target", created_at=NOW)
         self.service.enqueue(job_id="vk", package_id="pkg", platform="vk", target_ref="target", created_at=NOW)
         self.assertEqual(self.service.execute("tg", FakeAdapter(), NOW)["status"], "published")
-        self.assertEqual(self.service.execute("vk", FakeAdapter("fail"), NOW)["status"], "unknown_outcome")
+        self.assertEqual(self.service.execute("vk", FakeAdapter("fail", "vk"), NOW)["status"], "unknown_outcome")
 
     def test_timeout_is_unknown_and_requires_reconciliation_not_retry(self):
         self.approve("target")
@@ -105,6 +114,25 @@ class PublishServiceTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             self.service.enqueue(job_id="vk", package_id="pkg", platform="vk", target_ref="target", created_at=NOW)
 
+    def test_approved_master_must_be_inside_exact_package(self):
+        other_hash = PublishService.package_hash("caption", "[]")
+        with sqlite3.connect(self.path) as c:
+            c.execute(
+                "INSERT INTO publish_packages(id,project_id,revision_id,package_sha256,caption_text,assets_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                ("pkg-empty", "project", "revision", other_hash, "caption", "[]", "owner", NOW),
+            )
+            c.execute(
+                "INSERT INTO approval_decisions(id,project_id,revision_id,stage,subject_sha256,platform,target_ref,status,actor_id,actor_role,checklist_version,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("approval-empty", "project", "revision", "publish", other_hash,
+                 "telegram", "target", "approved", "owner", "publisher", "1", LATER, NOW),
+            )
+        self.service.enqueue(
+            job_id="empty", package_id="pkg-empty", platform="telegram",
+            target_ref="target", created_at=NOW,
+        )
+        with self.assertRaises(ValidationError):
+            self.service.execute("empty", FakeAdapter(), NOW)
+
     def test_send_intent_is_unknown_before_adapter_and_manual_cannot_confirm_api_job(self):
         self.approve("target")
         self.service.enqueue(job_id="tg", package_id="pkg", platform="telegram", target_ref="target", created_at=NOW)
@@ -123,11 +151,42 @@ class PublishServiceTests(unittest.TestCase):
 
     def test_external_boundary_is_disabled_by_default(self):
         self.approve("target")
-        guarded = PublishService(self.repo)
+        guarded = PublishService(self.repo, artifact_root=self.artifacts)
         guarded.enqueue(job_id="tg", package_id="pkg", platform="telegram",
                         target_ref="target", created_at=NOW)
         with self.assertRaises(ValidationError):
             guarded.execute("tg", FakeAdapter(), NOW)
+
+    def test_expiry_is_compared_as_an_instant_and_adapter_matches_platform(self):
+        with sqlite3.connect(self.path) as c:
+            c.execute(
+                "INSERT INTO approval_decisions(id,project_id,revision_id,stage,subject_sha256,platform,target_ref,status,actor_id,actor_role,checklist_version,expires_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ("offset-expired", "project", "revision", "publish", HASH,
+                 "telegram", "expired", "approved", "owner", "publisher", "1",
+                 "2026-10-13T13:00:00+03:00", "2026-10-13T09:00:00+00:00"),
+            )
+        with self.assertRaises(ValidationError):
+            self.service.enqueue(
+                job_id="expired", package_id="pkg", platform="telegram",
+                target_ref="expired", created_at=NOW,
+            )
+        self.approve("target", "vk")
+        self.service.enqueue(
+            job_id="vk-mismatch", package_id="pkg", platform="vk",
+            target_ref="target", created_at=NOW,
+        )
+        with self.assertRaises(ValidationError):
+            self.service.execute("vk-mismatch", FakeAdapter(platform="telegram"), NOW)
+
+    def test_asset_bytes_are_rechecked_at_send_boundary(self):
+        self.approve("target")
+        self.service.enqueue(
+            job_id="tampered", package_id="pkg", platform="telegram",
+            target_ref="target", created_at=NOW,
+        )
+        (self.artifacts / "master.mp4").write_bytes(b"tampered")
+        with self.assertRaises(ConflictError):
+            self.service.execute("tampered", FakeAdapter(), NOW)
 
 
 if __name__ == "__main__":

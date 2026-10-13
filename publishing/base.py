@@ -25,6 +25,7 @@ class DefinitivePublishError(RuntimeError):
 
 
 class PublisherAdapter(Protocol):
+    platform: str
     provider_key: str
     def send(self, request: PublishRequest) -> PublishResult: ...
 
