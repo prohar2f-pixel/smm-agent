@@ -118,11 +118,14 @@ def setup_scheduler(bot=None):
                         text=f"❌ Ошибка авто-публикации поста #{post['id']}: {e}",
                     )
 
-        scheduler.add_job(
-            auto_publish,
-            CronTrigger(minute=0),
-            id="auto_publish",
-            replace_existing=True,
-        )
+        # Legacy auto-publication is off by default. The production factory uses
+        # exact package approvals and PublishService instead of scheduled sends.
+        if os.getenv("LEGACY_AUTO_PUBLISH_ENABLED", "false").lower() == "true":
+            scheduler.add_job(
+                auto_publish,
+                CronTrigger(minute=0),
+                id="auto_publish",
+                replace_existing=True,
+            )
 
     return scheduler

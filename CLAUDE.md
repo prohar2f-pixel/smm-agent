@@ -79,6 +79,57 @@ smm-agent/
   brand_voice | posts | topics_used | competitor_signals | settings
 ```
 
+### R0 transactional foundation
+
+The `feat/content-factory-r0` branch adds infrastructure without changing bot commands or publication behavior:
+
+- `db/migrate.py` discovers ordered SQL migrations, verifies SHA-256 checksums and applies each version atomically;
+- `db/migrations/001_legacy_baseline.sql` preserves the existing schema;
+- `db/migrations/002_r0_control_plane.sql` adds disabled feature flags, inbox/outbox, audit and callback action tables;
+- `db/backup.py` creates a new SQLite backup, refuses overwrite and verifies integrity and migration history;
+- `docs/runbooks/database-safety.md` defines safe migration, restore and rollback steps.
+
+`agent.memory.init_db()` now runs migrations in `asyncio.to_thread`. New functionality stays disabled until a later release explicitly uses its feature flag. R0 does not migrate a production database automatically outside normal application startup and does not alter Telegram, VK or OpenRouter operations.
+
+### R1 source, brief and evidence core
+
+R1 adds an isolated domain layer on the same feature branch:
+
+- `domain/source_service.py` captures sources and verifies rights/privacy with compare-and-swap protection;
+- `domain/content_service.py` creates projects plus immutable brief and revision versions with canonical SHA-256 hashes;
+- `domain/readiness_service.py` stores claims, evidence and reviews, then evaluates the exact revision before production;
+- `db/migrations/003_r1_content_core.sql` adds normalized provenance and content tables;
+- `db/migrations/004_r1_scope_guards.sql` adds checklist versioning plus database-level pilot, project, asset, evidence and revision-lineage guards.
+
+These APIs are not connected to Telegram handlers, scheduler jobs, publication adapters or production startup flows. No R1 feature is enabled in production.
+
+### R2 transactional jobs, budgets and LLM core
+
+R2 package 3 adds disabled infrastructure for durable jobs, multi-scope budget
+reservations, immutable cost evidence, versioned prompts and schema-validated LLM
+runs. The implementation lives in `domain/job_service.py`,
+`domain/budget_service.py`, `domain/cost_service.py` and `llm/` with schema version
+6 in `db/migrations/006_r2_integrity_guards.sql` (after the R2 tables in migration 005).
+
+No Telegram handler, scheduler, worker, publisher or production startup path calls
+this core. A provider timeout is an `unknown_outcome`: the reservation remains held
+until provider evidence is reconciled. Prompt runs always select an exact semantic
+version; there is no implicit `latest`. See
+`docs/content-factory/r2-jobs-budget-llm.md` for recovery and operator rules.
+
+This is package 3 of the content-factory build, not the full product DoD R2. Idea
+intake, rendering, publication, analytics and learning loops remain deferred.
+
+### Production content factory
+
+Migrations 007-009 add fenced worker reports, exact-hash approvals, independent
+publishing jobs, measurement/reporting, Text Factory traceability and media
+contracts. `deployment.launch` is the production entrypoint and validates the
+environment before `main.py`. Publishing, paid generation and both legacy
+publication paths are disabled unless separately enabled. Deployment itself is
+never a content publication approval. Operational instructions are in
+`docs/runbooks/content-factory-production.md`.
+
 ---
 
 ## 5. Ключевые решения
@@ -94,6 +145,27 @@ smm-agent/
 ---
 
 ## 6. Тестирование
+
+Автоматическая проверка R0:
+
+```bash
+python3 -m py_compile db/migrate.py db/backup.py agent/memory.py
+python3 -m unittest discover -v
+```
+
+R1 domain verification:
+
+```bash
+python3 -m py_compile db/content_repository.py domain/source_service.py domain/content_service.py domain/readiness_service.py
+python3 -m unittest discover -v
+```
+
+R2 transactional-core verification:
+
+```bash
+python3 -m py_compile db/content_repository.py domain/job_service.py domain/budget_service.py domain/cost_service.py llm/prompt_registry.py llm/validators.py llm/gateway.py
+python3 -m unittest discover -v
+```
 
 **Где тестировать:** локально через `python main.py` с тестовым ботом (@тест-бот из BotFather).
 
@@ -123,6 +195,10 @@ smm-agent/
 | `.env.example` | Шаблон переменных без значений | При добавлении новой env-переменной |
 | `data/agent.db` | Вся память агента | Обновляется автоматически |
 | `agent/style_engine.py` | Логика онбординга и brand_voice | При изменении вопросов онбординга |
+| `db/migrations/` | Неизменяемая история схемы SQLite | Только новой additive migration |
+| `docs/runbooks/database-safety.md` | Backup, migration, restore и rollback | При изменении DB workflow |
+| `docs/content-factory/r1-source-brief-evidence.md` | Границы и проверки R1 domain core | При изменении Source/Brief/Evidence workflow |
+| `docs/content-factory/r2-jobs-budget-llm.md` | R2 jobs, budget, cost, prompt и LLM runbook | При изменении R2 transactional core |
 
 ---
 

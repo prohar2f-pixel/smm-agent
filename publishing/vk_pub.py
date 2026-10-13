@@ -12,6 +12,7 @@ def _get_vk():
 
 
 def publish_to_vk(text: str) -> int:
+    """Legacy direct publisher. New production flow uses PublishService guards."""
     vk = _get_vk()
     result = vk.wall.post(
         owner_id=f"-{VK_GROUP_ID}",
