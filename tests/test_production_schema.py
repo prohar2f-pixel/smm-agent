@@ -24,7 +24,7 @@ class ProductionSchemaTests(unittest.TestCase):
         return connection
 
     def test_migration_chain_reaches_version_seven(self):
-        self.assertEqual(run_migrations(self.path), [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(run_migrations(self.path), [1, 2, 3, 4, 5, 6, 7, 8])
 
     def test_production_tables_exist(self):
         run_migrations(self.path)
