@@ -68,6 +68,8 @@ class RuntimeFailClosedTests(unittest.TestCase):
         self.assertIn("worker_runner.run_once", source)
         self.assertIn("if config.control_plane_enabled:", source)
         self.assertIn("dp.include_router(factory_router)", source)
+        self.assertIn('os.getenv("TELEGRAM_HTTP_PROXY")', source)
+        self.assertIn("AiohttpSession(proxy=proxy)", source)
 
     def test_runtime_owns_text_factory_feature_gate(self):
         with tempfile.TemporaryDirectory() as directory:
