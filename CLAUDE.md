@@ -103,6 +103,23 @@ R1 adds an isolated domain layer on the same feature branch:
 
 These APIs are not connected to Telegram handlers, scheduler jobs, publication adapters or production startup flows. No R1 feature is enabled in production.
 
+### R2 transactional jobs, budgets and LLM core
+
+R2 package 3 adds disabled infrastructure for durable jobs, multi-scope budget
+reservations, immutable cost evidence, versioned prompts and schema-validated LLM
+runs. The implementation lives in `domain/job_service.py`,
+`domain/budget_service.py`, `domain/cost_service.py` and `llm/` with schema version
+5 in `db/migrations/005_r2_jobs_budget_llm.sql`.
+
+No Telegram handler, scheduler, worker, publisher or production startup path calls
+this core. A provider timeout is an `unknown_outcome`: the reservation remains held
+until provider evidence is reconciled. Prompt runs always select an exact semantic
+version; there is no implicit `latest`. See
+`docs/content-factory/r2-jobs-budget-llm.md` for recovery and operator rules.
+
+This is package 3 of the content-factory build, not the full product DoD R2. Idea
+intake, rendering, publication, analytics and learning loops remain deferred.
+
 ---
 
 ## 5. Ключевые решения
@@ -130,6 +147,13 @@ R1 domain verification:
 
 ```bash
 python3 -m py_compile db/content_repository.py domain/source_service.py domain/content_service.py domain/readiness_service.py
+python3 -m unittest discover -v
+```
+
+R2 transactional-core verification:
+
+```bash
+python3 -m py_compile db/content_repository.py domain/job_service.py domain/budget_service.py domain/cost_service.py llm/prompt_registry.py llm/validators.py llm/gateway.py
 python3 -m unittest discover -v
 ```
 
@@ -164,6 +188,7 @@ python3 -m unittest discover -v
 | `db/migrations/` | Неизменяемая история схемы SQLite | Только новой additive migration |
 | `docs/runbooks/database-safety.md` | Backup, migration, restore и rollback | При изменении DB workflow |
 | `docs/content-factory/r1-source-brief-evidence.md` | Границы и проверки R1 domain core | При изменении Source/Brief/Evidence workflow |
+| `docs/content-factory/r2-jobs-budget-llm.md` | R2 jobs, budget, cost, prompt и LLM runbook | При изменении R2 transactional core |
 
 ---
 
