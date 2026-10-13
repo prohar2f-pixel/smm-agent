@@ -159,6 +159,9 @@ async def cmd_queue(message: Message):
 
 @router.callback_query(F.data.startswith("approve:"))
 async def approve_post(callback: CallbackQuery):
+    if os.getenv("LEGACY_DIRECT_PUBLISH_ENABLED", "false").lower() != "true":
+        await callback.answer("Прямая публикация отключена. Используй production approval.", show_alert=True)
+        return
     post_id = int(callback.data.split(":")[1])
     post = await get_post(post_id)
     if not post:

@@ -51,3 +51,12 @@ def onboarding_done_kb() -> InlineKeyboardMarkup:
     builder.button(text="✏️ Изменить", callback_data="onboarding:edit")
     builder.adjust(1)
     return builder.as_markup()
+
+
+def factory_status_kb() -> InlineKeyboardMarkup:
+    """Read-only controls never imply approval or publication authority."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Обновить статус", callback_data="factory:status")
+    builder.button(text="Показать очередь", callback_data="factory:queue")
+    builder.adjust(1)
+    return builder.as_markup()

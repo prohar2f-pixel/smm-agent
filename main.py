@@ -12,6 +12,7 @@ from aiogram.types import BotCommand
 
 from agent.memory import init_db
 from bot.handlers import router
+from bot.content_factory_handlers import router as factory_router
 from bot.middlewares import AdminOnly
 from scheduler import setup_scheduler
 
@@ -29,6 +30,7 @@ async def main():
     dp.message.middleware(AdminOnly())
     dp.callback_query.middleware(AdminOnly())
     dp.include_router(router)
+    dp.include_router(factory_router)
 
     await bot.set_my_commands([
         BotCommand(command="start", description="Начать / повторный онбординг"),
@@ -40,6 +42,10 @@ async def main():
         BotCommand(command="add_vk", description="Добавить VK-группу конкурента"),
         BotCommand(command="dzen", description="Текст для Дзена"),
         BotCommand(command="instagram", description="Текст для Instagram"),
+        BotCommand(command="factory_status", description="Статус контент-завода"),
+        BotCommand(command="factory_queue", description="Очередь контент-завода"),
+        BotCommand(command="factory_reconcile", description="Сверка неизвестного результата"),
+        BotCommand(command="factory_report", description="Отчёт пилота"),
     ])
 
     scheduler = setup_scheduler(bot)
