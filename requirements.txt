@@ -7,3 +7,4 @@ openai==1.58.1
 python-dotenv==1.0.1
 aiosqlite==0.20.0
 jsonschema==4.10.3
+aiohttp-socks==0.12.0

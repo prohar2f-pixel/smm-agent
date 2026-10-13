@@ -8,6 +8,7 @@ from safe_logging import configure_safe_logging
 load_dotenv()
 
 from aiogram import Bot, Dispatcher
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 
@@ -45,7 +46,9 @@ async def main():
     # injected only by an explicitly authorized command path.
     _ = publish_service
 
-    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    proxy = os.getenv("TELEGRAM_HTTP_PROXY")
+    bot_options = {"session": AiohttpSession(proxy=proxy)} if proxy else {}
+    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"), **bot_options)
     dp = Dispatcher(storage=MemoryStorage())
 
     dp.message.middleware(AdminOnly())
