@@ -120,6 +120,16 @@ version; there is no implicit `latest`. See
 This is package 3 of the content-factory build, not the full product DoD R2. Idea
 intake, rendering, publication, analytics and learning loops remain deferred.
 
+### Production content factory
+
+Migrations 007-009 add fenced worker reports, exact-hash approvals, independent
+publishing jobs, measurement/reporting, Text Factory traceability and media
+contracts. `deployment.launch` is the production entrypoint and validates the
+environment before `main.py`. Publishing, paid generation and both legacy
+publication paths are disabled unless separately enabled. Deployment itself is
+never a content publication approval. Operational instructions are in
+`docs/runbooks/content-factory-production.md`.
+
 ---
 
 ## 5. Ключевые решения
