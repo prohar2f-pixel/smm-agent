@@ -109,10 +109,10 @@ class R1SchemaTests(unittest.TestCase):
                 ("brief-1", "revision-1", "project-1"),
             )
 
-    def test_migration_chain_reaches_version_three(self):
+    def test_migration_chain_includes_current_version(self):
         applied = run_migrations(self.db_path)
 
-        self.assertEqual(applied, [1, 2, 3, 4])
+        self.assertEqual(applied, [1, 2, 3, 4, 5])
 
     def test_foreign_keys_reject_missing_pilot_and_revision(self):
         run_migrations(self.db_path)
