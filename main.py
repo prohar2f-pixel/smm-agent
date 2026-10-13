@@ -47,9 +47,10 @@ async def main():
     dp.message.middleware(AdminOnly())
     dp.callback_query.middleware(AdminOnly())
     dp.include_router(router)
-    dp.include_router(factory_router)
+    if config.control_plane_enabled:
+        dp.include_router(factory_router)
 
-    await bot.set_my_commands([
+    commands = [
         BotCommand(command="start", description="Начать / повторный онбординг"),
         BotCommand(command="plan", description="Сгенерировать план на неделю"),
         BotCommand(command="queue", description="Посты на согласование"),
@@ -59,11 +60,15 @@ async def main():
         BotCommand(command="add_vk", description="Добавить VK-группу конкурента"),
         BotCommand(command="dzen", description="Текст для Дзена"),
         BotCommand(command="instagram", description="Текст для Instagram"),
-        BotCommand(command="factory_status", description="Статус контент-завода"),
-        BotCommand(command="factory_queue", description="Очередь контент-завода"),
-        BotCommand(command="factory_reconcile", description="Сверка неизвестного результата"),
-        BotCommand(command="factory_report", description="Отчёт пилота"),
-    ])
+    ]
+    if config.control_plane_enabled:
+        commands.extend([
+            BotCommand(command="factory_status", description="Статус контент-завода"),
+            BotCommand(command="factory_queue", description="Очередь контент-завода"),
+            BotCommand(command="factory_reconcile", description="Сверка неизвестного результата"),
+            BotCommand(command="factory_report", description="Отчёт пилота"),
+        ])
+    await bot.set_my_commands(commands)
 
     scheduler = setup_scheduler(bot)
     scheduler.start()

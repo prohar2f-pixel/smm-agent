@@ -65,6 +65,8 @@ class RuntimeFailClosedTests(unittest.TestCase):
         source = Path("main.py").read_text()
         self.assertIn("runtime.publish_service()", source)
         self.assertIn("runtime.worker_runner({})", source)
+        self.assertIn("if config.control_plane_enabled:", source)
+        self.assertIn("dp.include_router(factory_router)", source)
 
 
 if __name__ == "__main__":
