@@ -5,6 +5,7 @@ CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
 
 
 async def publish_to_telegram(bot: Bot, text: str) -> int:
+    """Legacy direct publisher. New production flow uses PublishService guards."""
     msg = await bot.send_message(
         chat_id=CHANNEL_ID,
         text=text,
