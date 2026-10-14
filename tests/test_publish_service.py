@@ -100,12 +100,26 @@ class PublishServiceTests(unittest.TestCase):
             self.service.execute("tg", FakeAdapter(), NOW)
         self.assertEqual(self.service.reconcile("tg", FakeAdapter("reconcile"), NOW)["external_id"], "external-r")
 
+    def test_unknown_outcome_can_be_closed_with_owner_provider_evidence(self):
+        self.approve("target")
+        self.service.enqueue(job_id="evidence", package_id="pkg", platform="telegram",
+                             target_ref="target", created_at=NOW)
+        self.service.execute("evidence", FakeAdapter("timeout"), NOW)
+        with self.assertRaises(ValidationError):
+            self.service.confirm_reconciliation("evidence", "", "", NOW)
+        row = self.service.confirm_reconciliation(
+            "evidence", "message-42", "telegram://target/42", NOW,
+        )
+        self.assertEqual((row["status"], row["external_id"]),
+                         ("published", "message-42"))
+
     def test_manual_mode_requires_verified_evidence(self):
         self.approve("manual-target", "manual")
         self.service.enqueue(job_id="manual", package_id="pkg", platform="manual", target_ref="manual-target", created_at=NOW)
         with self.assertRaises(ValidationError):
             self.service.confirm_manual("manual", "", "", NOW)
-        self.assertEqual(self.service.confirm_manual("manual", "post-1", "screenshot://1", NOW)["status"], "published")
+        guarded = PublishService(self.repo, artifact_root=self.artifacts)
+        self.assertEqual(guarded.confirm_manual("manual", "post-1", "screenshot://1", NOW)["status"], "published")
 
     def test_later_invalidation_blocks_enqueue_and_already_queued_send(self):
         self.approve("target")

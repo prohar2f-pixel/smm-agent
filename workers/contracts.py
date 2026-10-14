@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any, Literal
@@ -11,6 +13,14 @@ from domain.errors import ValidationError
 
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 SEMVER = re.compile(r"^[1-9][0-9]*\.[0-9]+\.[0-9]+$")
+
+
+def canonical_manifest_hash(payload: dict[str, Any]) -> str:
+    stable = {key: value for key, value in payload.items()
+              if key not in {"input_sha256", "job_id", "fence_token"}}
+    encoded = json.dumps(stable, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _hash(value: str | None, name: str, required: bool = True) -> None:

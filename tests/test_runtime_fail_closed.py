@@ -103,6 +103,21 @@ class RuntimeFailClosedTests(unittest.TestCase):
             self.assertEqual(result.status, "queued")
             self.assertEqual(result.attempt_count, 1)
 
+    def test_worker_exhaustion_becomes_terminal_failed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "agent.db"
+            config = FactoryConfig.from_env({"DB_PATH":str(path), "ADMIN_TELEGRAM_ID":"1"})
+            FactoryRuntime(config).startup()
+            jobs = JobService(ContentRepository(path))
+            jobs.enqueue("j","c","screen_demo",None,None,None,{},
+                         "2026-10-13T12:00:00+00:00","2026-10-13T12:00:00+00:00")
+            with sqlite3.connect(path) as c:
+                c.execute("UPDATE jobs SET max_attempts=1 WHERE id='j'")
+            runner = WorkerRunner(jobs, {"screen_demo": lambda _claim: (_ for _ in ()).throw(RuntimeError())}, enabled=True)
+            result = runner.run_once("w","2026-10-13T12:00:00+00:00",
+                                     "2026-10-13T12:10:00+00:00")
+            self.assertEqual(result.status, "failed")
+
     def test_control_plane_enqueues_complete_screen_demo_manifest_idempotently(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "agent.db"
@@ -126,7 +141,7 @@ class RuntimeFailClosedTests(unittest.TestCase):
                 payload=payload, stage="preview", created_at=now,
             )
             second = runtime.enqueue_screen_demo(
-                command_id="cmd", job_id="other", project_id="project",
+                command_id="cmd", job_id="job", project_id="project",
                 payload=payload, stage="preview", created_at=now,
             )
             self.assertEqual((first.id, second.id), ("job", "job"))
@@ -134,6 +149,23 @@ class RuntimeFailClosedTests(unittest.TestCase):
             manifest = json.loads(stored["payload_json"])
             self.assertEqual(manifest["render_profile"], "screen-demo-preview-v1")
             self.assertEqual(manifest["asset_role"], "preview")
+
+            with self.assertRaises(ValidationError):
+                runtime.enqueue_screen_demo(
+                    command_id="master-forged", job_id="master", project_id="project",
+                    payload=dict(payload, approved_preview_sha256="f"*64),
+                    stage="master", created_at=now,
+                )
+
+    def test_artifact_root_cannot_contain_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = FactoryRuntime(FactoryConfig(
+                db_path=root / "agent.db", admin_telegram_id=1,
+                artifact_root=root,
+            ))
+            with self.assertRaises(ValidationError):
+                runtime.startup()
 
 
 if __name__ == "__main__":

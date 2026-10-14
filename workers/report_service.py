@@ -17,7 +17,7 @@ from domain.artifact_integrity import verified_asset_path
 from domain.errors import ConflictError, NotFoundError
 from domain.job_service import JobService
 from domain.production_models import WorkerReportRecord
-from workers.contracts import WorkerReport
+from workers.contracts import WorkerReport, canonical_manifest_hash
 
 
 @dataclass(frozen=True)
@@ -139,8 +139,18 @@ class WorkerReportService:
                     or job["lease_until"] < accepted_at
                     or payload.get("input_sha256") != report.input_sha256):
                 raise ConflictError("stale worker lease or input")
+            if canonical_manifest_hash(payload) != payload.get("input_sha256"):
+                raise ConflictError("worker manifest integrity mismatch")
             if job["project_id"] is None or job["revision_id"] is None:
                 raise ConflictError("successful worker job requires project and revision scope")
+            project = connection.execute(
+                "SELECT current_revision_id,status FROM content_projects WHERE id=?",
+                (job["project_id"],),
+            ).fetchone()
+            if (project is None or project["current_revision_id"] != job["revision_id"]
+                    or project["status"] not in (
+                        "production_ready", "preview_review", "accepted", "publish_ready")):
+                raise ConflictError("worker job revision is no longer current")
             if report.status == "succeeded":
                 artifact = self.verifier.verify(report, payload)
                 asset_id = f"{report.report_id}:asset"
@@ -153,8 +163,20 @@ class WorkerReportService:
                      payload.get("asset_role", "preview"), artifact.storage_key,
                      artifact.sha256, artifact.mime_type, artifact.size_bytes,
                      artifact.duration_ms, artifact.width, artifact.height, report.job_id,
-                     "pending", "pending", report.created_at),
+                    "pending", "pending", report.created_at),
                 )
+                for check_code in (
+                    "duration_in_profile", "media_readable", "profile_matches",
+                ):
+                    connection.execute(
+                        """INSERT INTO qa_results(id,project_id,revision_id,asset_id,
+                        stage,check_code,status,details_json,created_by,created_at)
+                        VALUES(?,?,?,?,? ,?,'pass',?,'worker',?)""",
+                        (f"{report.report_id}:qa:{check_code}", job["project_id"],
+                         job["revision_id"], asset_id, "technical", check_code,
+                         json.dumps({"worker_report_id": report.report_id}, sort_keys=True),
+                         report.created_at),
+                    )
             qa = dict(report.machine_qa)
             qa["_fingerprint"] = fingerprint
             connection.execute(

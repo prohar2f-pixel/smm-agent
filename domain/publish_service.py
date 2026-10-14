@@ -232,9 +232,27 @@ class PublishService:
                     raise ConflictError("external operation reconciliation lost state race")
         return self.get(job_id)
 
+    def confirm_reconciliation(self, job_id: str, external_id: str,
+                               evidence_ref: str, at: str):
+        result = PublishResult(external_id, evidence_ref)
+        try:
+            result.validate()
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        with self.repository.transaction() as connection:
+            row = connection.execute(
+                """SELECT pa.attempt_no,pa.idempotency_key FROM publish_attempts pa
+                JOIN publish_jobs pj ON pj.id=pa.publish_job_id
+                WHERE pj.id=? AND pj.status='unknown_outcome'
+                AND pa.status='unknown_outcome' ORDER BY pa.attempt_no DESC LIMIT 1""",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise ConflictError("publish job is not awaiting reconciliation")
+        return self._settle(job_id, row["attempt_no"], row["idempotency_key"],
+                            "reconciled", result, None, at)
+
     def confirm_manual(self, job_id: str, external_id: str, evidence_ref: str, at: str):
-        if not self.publishing_enabled:
-            raise ValidationError("publishing feature is disabled")
         if self.artifact_root is None:
             raise ValidationError("publishing requires an artifact root")
         if not external_id or not evidence_ref:

@@ -1,4 +1,5 @@
 import os
+import asyncio
 from typing import TYPE_CHECKING, Callable
 
 from publishing.base import PublishRequest, PublishResult
@@ -44,6 +45,45 @@ class TelegramPublisherAdapter:
         return PublishResult(str(response.get("external_id", "")),
                              str(response.get("evidence_ref", "")))
 
+
+class AiogramTelegramTransport:
+    """Thread-safe bridge from the synchronous publish ledger to aiogram."""
+
+    def __init__(self, bot: "Bot", loop, *, timeout_sec: int = 120):
+        self.bot = bot
+        self.loop = loop
+        self.timeout_sec = timeout_sec
+
+    def __call__(self, **payload) -> dict:
+        future = asyncio.run_coroutine_threadsafe(self._send(payload), self.loop)
+        return future.result(timeout=self.timeout_sec)
+
+    async def _send(self, payload) -> dict:
+        from aiogram.types import BufferedInputFile
+
+        assets = payload["assets"]
+        target = payload["target_ref"]
+        caption = payload["caption_text"]
+        if len(assets) > 1:
+            raise ValueError("Telegram adapter currently requires one canonical master asset")
+        if not assets:
+            message = await self.bot.send_message(chat_id=target, text=caption)
+        else:
+            asset = assets[0]
+            extension = asset["mime_type"].split("/")[-1].replace("jpeg", "jpg")
+            upload = BufferedInputFile(asset["bytes"], filename=f"asset.{extension}")
+            if asset["mime_type"].startswith("video/"):
+                message = await self.bot.send_video(chat_id=target, video=upload,
+                                                    caption=caption)
+            elif asset["mime_type"].startswith("image/"):
+                message = await self.bot.send_photo(chat_id=target, photo=upload,
+                                                    caption=caption)
+            else:
+                message = await self.bot.send_document(chat_id=target, document=upload,
+                                                       caption=caption)
+        external_id = str(message.message_id)
+        return {"external_id": external_id,
+                "evidence_ref": f"telegram://{target}/{external_id}"}
 
 async def publish_to_telegram(bot: "Bot", text: str) -> int:
     """Legacy direct publisher. New production flow uses PublishService guards."""

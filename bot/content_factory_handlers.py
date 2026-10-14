@@ -19,6 +19,12 @@ from domain.publish_service import PublishService
 from reporting.pilot_report import PilotReportBuilder
 
 router = Router()
+_PUBLISH_ADAPTERS = {}
+
+
+def configure_publish_adapters(adapters: dict) -> None:
+    global _PUBLISH_ADAPTERS
+    _PUBLISH_ADAPTERS = dict(adapters)
 
 
 def _context():
@@ -143,7 +149,23 @@ async def factory_queue(message: Message):
 
 @router.message(Command("factory_reconcile"))
 async def factory_reconcile(message: Message):
-    await _answer(message, _reconcile_text)
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 1:
+        await _answer(message, _reconcile_text)
+        return
+
+    def reconcile():
+        job_id = parts[1].strip()
+        config, repository = _context()
+        row = repository.fetchone("SELECT platform FROM publish_jobs WHERE id=?", (job_id,))
+        if row is None or row["platform"] not in _PUBLISH_ADAPTERS:
+            raise ValueError("для job нет настроенного provider adapter")
+        result = PublishService(
+            repository, publishing_enabled=config.publishing_enabled,
+            artifact_root=config.artifact_root,
+        ).reconcile(job_id, _PUBLISH_ADAPTERS[row["platform"]], _now())
+        return f"Reconcile {job_id}: {result['status']}"
+    await _answer(message, reconcile)
 
 
 @router.message(Command("factory_report"))
@@ -183,6 +205,26 @@ async def factory_approve(message: Message):
     await _answer(message, approve)
 
 
+@router.message(Command("factory_qa"))
+async def factory_qa(message: Message):
+    def record():
+        payload = _json_argument(message)
+        config, repository = _context()
+        command_id = f"telegram:{message.chat.id}:{message.message_id}:factory_qa"
+        row = ApprovalService(repository).record_qa(
+            qa_id=str(uuid.uuid5(uuid.NAMESPACE_URL, command_id)),
+            project_id=str(payload["project_id"]),
+            revision_id=str(payload["revision_id"]),
+            asset_id=str(payload["asset_id"]),
+            check_code=str(payload["check_code"]), status=str(payload["status"]),
+            actor_id=str(config.admin_telegram_id),
+            actor_role=str(payload.get("actor_role", "owner")), created_at=_now(),
+            details=payload.get("details"),
+        )
+        return f"QA {row['id']}: {row['check_code']} / {row['status']}"
+    await _answer(message, record)
+
+
 @router.message(Command("factory_publish_enqueue"))
 async def factory_publish_enqueue(message: Message):
     def enqueue_publish():
@@ -200,3 +242,35 @@ async def factory_publish_enqueue(message: Message):
         return (f"Publish job {row['id']}: {row['status']}. "
                 "Отправка не выполнялась этой командой.")
     await _answer(message, enqueue_publish)
+
+
+@router.message(Command("factory_manual_confirm"))
+async def factory_manual_confirm(message: Message):
+    def confirm():
+        payload = _json_argument(message)
+        config, repository = _context()
+        row = PublishService(
+            repository, publishing_enabled=config.publishing_enabled,
+            artifact_root=config.artifact_root,
+        ).confirm_manual(
+            str(payload["job_id"]), str(payload["external_id"]),
+            str(payload["evidence_ref"]), _now(),
+        )
+        return f"Manual publish {row['id']}: {row['status']}"
+    await _answer(message, confirm)
+
+
+@router.message(Command("factory_reconcile_confirm"))
+async def factory_reconcile_confirm(message: Message):
+    def confirm():
+        payload = _json_argument(message)
+        config, repository = _context()
+        row = PublishService(
+            repository, publishing_enabled=config.publishing_enabled,
+            artifact_root=config.artifact_root,
+        ).confirm_reconciliation(
+            str(payload["job_id"]), str(payload["external_id"]),
+            str(payload["evidence_ref"]), _now(),
+        )
+        return f"Reconcile evidence {row['id']}: {row['status']}"
+    await _answer(message, confirm)

@@ -37,7 +37,7 @@ class PilotReportingTests(unittest.TestCase):
     def _seed(self):
         with sqlite3.connect(self.path) as c:
             c.execute("PRAGMA foreign_keys=ON")
-            c.execute("INSERT INTO pilot_passports(id,name,status,timezone,evaluation_mode,target_count,thresholds_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", ("pilot","Pilot","observing","UTC","internal_efficiency",1,'{"required_metrics":["views"]}',NOW,NOW))
+            c.execute("INSERT INTO pilot_passports(id,name,status,timezone,evaluation_mode,target_count,thresholds_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)", ("pilot","Pilot","observing","UTC","internal_efficiency",1,'{"required_metrics":["views"],"max_manual_sec_per_package":800,"max_cycle_sec":86400,"currency":"RUB","max_production_cost_minor":1000,"min_quality_score":1.0}',NOW,NOW))
             c.execute("INSERT INTO content_projects(id,pilot_id,title,status,owner_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?)", ("project","pilot","Demo","observing","owner",NOW,NOW))
             c.execute("INSERT INTO sources(id,pilot_id,kind,original_ref,captured_at,content_sha256,rights_status,privacy_status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)", ("source","pilot","file","real-source",NOW,"f"*64,"allowed","clear",NOW,NOW))
             c.execute("INSERT INTO content_project_sources(project_id,source_id,created_at) VALUES(?,?,?)", ("project","source",NOW))
@@ -47,7 +47,7 @@ class PilotReportingTests(unittest.TestCase):
             c.execute("INSERT INTO approval_decisions(id,project_id,revision_id,stage,subject_sha256,status,actor_id,actor_role,checklist_version,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", ("final","project","revision","final","d"*64,"approved","owner","owner","1",NOW))
             c.execute("INSERT INTO publish_packages(id,project_id,revision_id,package_sha256,caption_text,assets_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)", ("pkg","project","revision",PublishService.package_hash("caption", '["master"]'),"caption",'["master"]',"owner",NOW))
             c.execute("INSERT INTO publish_jobs(id,package_id,platform,target_ref,status,external_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", ("job","pkg","telegram","target","published","post",NOW,NOW))
-            c.execute("INSERT INTO baselines(id,pilot_id,kind,comparable_format,duration_sec,evidence_ref,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)", ("base","pilot","manual","screen_demo",1000,"evidence","owner",NOW))
+            c.execute("INSERT INTO baselines(id,pilot_id,kind,comparable_format,duration_sec,quality_score,evidence_ref,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)", ("base","pilot","manual","screen_demo",1000,1.0,"evidence","owner",NOW))
             for index, code in enumerate(QA_CODES):
                 c.execute("INSERT INTO qa_results(id,project_id,revision_id,asset_id,stage,check_code,status,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)", (f"qa-{index}","project","revision","master","final",code,"pass","reviewer",NOW))
         self.measure.add_time(entry_id="t", pilot_id="pilot", project_id="project", actor_id="u", role="editor", stage="production", started_at=NOW, stopped_at=NOW, active_sec=700, rate_minor_per_hour=1000, currency="RUB", created_at=NOW)
@@ -117,7 +117,7 @@ class PilotReportingTests(unittest.TestCase):
                                         captured_at=CAPTURED[window], created_at=CAPTURED[window])
         report = PilotReportBuilder(self.repo).build("pilot")
         self.assertEqual(report.decision, "insufficient_data")
-        self.assertIn("Принято пакетов: 1 из 2", report.markdown)
+        self.assertIn("Принято независимых комплектов: 1 из 2", report.markdown)
 
     def test_metric_captured_before_window_matures_is_missing(self):
         for window in ("24h", "72h", "7d"):
@@ -153,6 +153,35 @@ class PilotReportingTests(unittest.TestCase):
                                     captured_at=CAPTURED[window], created_at=CAPTURED[window])
         self.assertEqual(PilotReportBuilder(self.repo).build("pilot").decision,
                          "insufficient_data")
+
+    def test_multiple_packages_and_sources_on_one_project_cannot_fake_target(self):
+        package_hash = PublishService.package_hash("caption2", '["master"]')
+        with sqlite3.connect(self.path) as c:
+            c.execute("UPDATE pilot_passports SET target_count=2 WHERE id='pilot'")
+            c.execute("INSERT INTO sources(id,pilot_id,kind,original_ref,captured_at,content_sha256,rights_status,privacy_status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)", ("source2","pilot","file","second",NOW,"e"*64,"allowed","clear",NOW,NOW))
+            c.execute("INSERT INTO content_project_sources(project_id,source_id,created_at) VALUES(?,?,?)", ("project","source2",NOW))
+            c.execute("INSERT INTO publish_packages(id,project_id,revision_id,package_sha256,caption_text,assets_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)", ("pkg2","project","revision",package_hash,"caption2",'["master"]',"owner",NOW))
+            c.execute("INSERT INTO publish_jobs(id,package_id,platform,target_ref,status,external_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)", ("job2","pkg2","telegram","target2","published","post2",NOW,NOW))
+        for job in ("job", "job2"):
+            for window in ("24h", "72h", "7d"):
+                self.measure.add_metric(snapshot_id=f"one-project-{job}-{window}",
+                                        publish_job_id=job, window=window,
+                                        metric_name="views", value=1, measured=True,
+                                        definition="views", source="api",
+                                        captured_at=CAPTURED[window], created_at=CAPTURED[window])
+        self.assertEqual(PilotReportBuilder(self.repo).build("pilot").decision,
+                         "insufficient_data")
+
+    def test_breached_approved_manual_time_cap_fails_pilot(self):
+        with sqlite3.connect(self.path) as c:
+            c.execute("UPDATE pilot_passports SET thresholds_json=? WHERE id='pilot'",
+                      ('{"required_metrics":["views"],"max_manual_sec_per_package":600,"max_cycle_sec":86400,"currency":"RUB","max_production_cost_minor":1000,"min_quality_score":1.0}',))
+        for window in ("24h", "72h", "7d"):
+            self.measure.add_metric(snapshot_id=f"cap-{window}", publish_job_id="job",
+                                    window=window, metric_name="views", value=1,
+                                    measured=True, definition="views", source="api",
+                                    captured_at=CAPTURED[window], created_at=CAPTURED[window])
+        self.assertEqual(PilotReportBuilder(self.repo).build("pilot").decision, "failure")
 
 
 if __name__ == "__main__":

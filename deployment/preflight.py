@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -66,6 +67,14 @@ def validate_pilot(repository: ContentRepository, pilot_id: str) -> tuple[str, .
     for key in ("thresholds_json", "labor_rates_json", "allocation_policy_json"):
         if row[key] in (None, "", "{}"):
             errors.append(f"pilot missing {key}")
+    try:
+        thresholds = json.loads(row["thresholds_json"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        thresholds = {}
+    for key in ("required_metrics", "max_manual_sec_per_package", "max_cycle_sec",
+                "currency", "max_production_cost_minor", "min_quality_score"):
+        if key not in thresholds:
+            errors.append(f"pilot thresholds missing {key}")
     if not row["baseline_ref"]:
         errors.append("pilot missing baseline_ref")
     return tuple(errors)

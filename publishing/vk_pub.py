@@ -1,4 +1,5 @@
 import os
+import io
 from typing import Callable
 
 from publishing.base import PublishRequest, PublishResult
@@ -49,6 +50,51 @@ class VkPublisherAdapter:
         return PublishResult(str(response.get("external_id", "")),
                              str(response.get("evidence_ref", "")))
 
+
+class _NamedBytesIO(io.BytesIO):
+    def __init__(self, data: bytes, name: str):
+        super().__init__(data)
+        self.name = name
+
+
+class VkApiTransport:
+    """Concrete VK wall transport with provider random_id idempotency."""
+
+    def __init__(self, token: str):
+        import vk_api
+        self.session = vk_api.VkApi(token=token)
+        self.api = self.session.get_api()
+        self.upload = vk_api.VkUpload(self.session)
+
+    def __call__(self, **payload) -> dict:
+        group_id = abs(int(str(payload["target_ref"]).removeprefix("-")))
+        attachments = []
+        for index, asset in enumerate(payload["assets"]):
+            mime = asset["mime_type"]
+            extension = mime.split("/")[-1].replace("jpeg", "jpg")
+            stream = _NamedBytesIO(asset["bytes"], f"asset-{index}.{extension}")
+            if mime.startswith("video/"):
+                result = self.upload.video(
+                    video_file=stream, name="Content Factory", group_id=group_id,
+                )
+                owner = result.get("owner_id", -group_id)
+                video_id = result.get("video_id") or result.get("id")
+                attachments.append(f"video{owner}_{video_id}")
+            elif mime.startswith("image/"):
+                photos = self.upload.photo_wall([stream], group_id=group_id)
+                attachments.extend(
+                    f"photo{photo['owner_id']}_{photo['id']}" for photo in photos
+                )
+            else:
+                raise ValueError(f"VK adapter does not support {mime}")
+        response = self.api.wall.post(
+            owner_id=-group_id, from_group=1, message=payload["caption_text"],
+            attachments=",".join(attachments),
+            random_id=int(payload["idempotency_key"][:8], 16),
+        )
+        post_id = str(response["post_id"])
+        return {"external_id": post_id,
+                "evidence_ref": f"https://vk.com/wall-{group_id}_{post_id}"}
 
 def publish_to_vk(text: str) -> int:
     """Legacy direct publisher. New production flow uses PublishService guards."""

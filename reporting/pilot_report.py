@@ -154,9 +154,15 @@ class PilotReportBuilder:
             failed_codes = {row["check_code"] for row in qa if row["status"] == "fail"}
             if (self.REQUIRED_QA.issubset(passed_codes)
                     and not self.REQUIRED_QA.intersection(failed_codes)):
-                accepted_packages.append(package)
-        source_ids = set()
+                accepted_packages.append({**dict(package),
+                                          "master_id": approved_master["id"],
+                                          "master_sha256": approved_master["sha256"]})
+        accepted_by_project = {}
         for package in accepted_packages:
+            accepted_by_project.setdefault(package["project_id"], package)
+        accepted_units = list(accepted_by_project.values())
+        source_ids = set()
+        for package in accepted_units:
             rows = self.repository.fetchall(
                 "SELECT source_id FROM content_project_sources WHERE project_id=?",
                 (package["project_id"],),
@@ -169,7 +175,7 @@ class PilotReportBuilder:
                     project_times.get(entry["project_id"], 0) + entry["active_sec"]
                 )
         pilot_samples = [project_times[package["project_id"]]
-                         for package in accepted_packages
+                         for package in accepted_units
                          if package["project_id"] in project_times]
         baselines = self.repository.fetchall(
             """SELECT duration_sec FROM baselines WHERE pilot_id=?
@@ -181,13 +187,53 @@ class PilotReportBuilder:
         reduction = None
         if median_baseline and median_pilot is not None:
             reduction = 1 - median_pilot / median_baseline
-        qa_complete = len(accepted_packages) >= pilot["target_count"]
+        qa_complete = (len(accepted_units) >= pilot["target_count"]
+                       and len({package["master_sha256"] for package in accepted_units})
+                       >= pilot["target_count"])
         distinct_sources = len(source_ids) >= pilot["target_count"]
+        cap_keys = ("max_manual_sec_per_package", "max_cycle_sec", "currency",
+                    "max_production_cost_minor", "min_quality_score")
+        caps_configured = all(key in thresholds for key in cap_keys)
+        cycles = []
+        for package in accepted_units:
+            project = self.repository.fetchone(
+                "SELECT created_at FROM content_projects WHERE id=?",
+                (package["project_id"],),
+            )
+            first_publish = self.repository.fetchone(
+                """SELECT MIN(pj.updated_at) AS published_at FROM publish_jobs pj
+                JOIN publish_packages pp ON pp.id=pj.package_id
+                WHERE pp.project_id=? AND pj.status='published'""",
+                (package["project_id"],),
+            )
+            if project and first_publish and first_publish["published_at"]:
+                cycles.append((parse_instant(first_publish["published_at"], "published_at")
+                               - parse_instant(project["created_at"], "created_at")).total_seconds())
+        cap_ok = False
+        if caps_configured:
+            currency = thresholds["currency"]
+            production_cost = labor_costs.get(currency, 0) + provider_costs.get(currency, 0)
+            baseline_quality = [row["quality_score"] for row in self.repository.fetchall(
+                """SELECT quality_score FROM baselines WHERE pilot_id=?
+                AND comparable_format='screen_demo' AND quality_score IS NOT NULL""",
+                (pilot_id,),
+            )]
+            cap_ok = (
+                all(sample <= thresholds["max_manual_sec_per_package"]
+                    for sample in pilot_samples)
+                and len(cycles) >= pilot["target_count"]
+                and all(0 <= cycle <= thresholds["max_cycle_sec"] for cycle in cycles)
+                and production_cost <= thresholds["max_production_cost_minor"]
+                and bool(baseline_quality)
+                and 1.0 >= thresholds["min_quality_score"]
+                and 1.0 >= median(baseline_quality)
+            )
         sufficient = (bool(times) and active > 0 and labor_known and bool(required_metrics)
                       and qa_complete and distinct_sources and not missing
                       and not unknown and median_baseline is not None
-                      and len(pilot_samples) >= pilot["target_count"])
-        success = sufficient and reduction is not None and reduction >= 0.20
+                      and len(pilot_samples) >= pilot["target_count"]
+                      and caps_configured)
+        success = (sufficient and cap_ok and reduction is not None and reduction >= 0.20)
         decision = "insufficient_data" if not sufficient else ("success" if success else "failure")
         metric_lines = [
             f"- {row['publish_job_id']} {row['window']} {row['metric_name']}: "
@@ -213,7 +259,7 @@ class PilotReportBuilder:
             "", "## Метрики", "", *metric_lines, "",
             f"- Отсутствующие окна: {', '.join(missing) if missing else 'нет'}.",
             f"- Опубликовано platform jobs: {len(published)}.",
-            f"- Принято пакетов: {len(accepted_packages)} из {pilot['target_count']}.",
+            f"- Принято независимых комплектов: {len(accepted_units)} из {pilot['target_count']}.",
             f"- Разных исходников: {len(source_ids)} из {pilot['target_count']}.",
             f"- Неопределённые внешние операции: {'да' if unknown else 'нет'}.",
             "", "## Решение", "", f"**{decision}**", "",

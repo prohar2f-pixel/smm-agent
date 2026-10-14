@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 from domain.job_service import JobService
+from domain.time_utils import parse_instant
 
 
 class WorkerRunner:
@@ -24,7 +27,10 @@ class WorkerRunner:
         try:
             return self.handlers[claim.kind](claim)
         except Exception as exc:
+            delay = min(30 * (2 ** max(0, claim.attempt_count - 1)), 900)
+            available_at = (parse_instant(now, "worker time")
+                            + timedelta(seconds=delay)).isoformat()
             return self.job_service.fail_retryable(
                 claim.id, worker_id, claim.fence_token,
-                type(exc).__name__.upper(), now, now,
+                type(exc).__name__.upper(), available_at, now,
             )

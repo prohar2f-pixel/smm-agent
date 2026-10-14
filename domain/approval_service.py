@@ -32,6 +32,39 @@ class ApprovalService:
         with self.repository.transaction() as connection:
             return self.decide_in_transaction(connection, **decision)
 
+    def record_qa(self, *, qa_id: str, project_id: str, revision_id: str,
+                  asset_id: str, check_code: str, status: str, actor_id: str,
+                  actor_role: str, created_at: str, details: dict | None = None):
+        if check_code not in FINAL_QA_CODES or status not in ("pass", "fail", "not_applicable"):
+            raise ValidationError("invalid QA result")
+        with self.repository.transaction() as connection:
+            row = connection.execute(
+                """SELECT p.current_revision_id,p.owner_id,pp.roles_json
+                FROM assets a JOIN content_projects p ON p.id=a.project_id
+                JOIN pilot_passports pp ON pp.id=p.pilot_id
+                WHERE a.id=? AND a.project_id=? AND a.revision_id=?""",
+                (asset_id, project_id, revision_id),
+            ).fetchone()
+            if row is None or row["current_revision_id"] != revision_id:
+                raise ConflictError("QA requires an exact current-revision asset")
+            roles = json.loads(row["roles_json"] or "{}")
+            reviewers = set(roles.get("reviewer", []))
+            if actor_id == row["owner_id"]:
+                reviewers.add(actor_id)
+            if actor_role not in ("owner", "reviewer") or actor_id not in reviewers:
+                raise ValidationError("actor is not assigned to QA review")
+            try:
+                connection.execute(
+                    """INSERT INTO qa_results(id,project_id,revision_id,asset_id,stage,
+                    check_code,status,details_json,created_by,created_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (qa_id, project_id, revision_id, asset_id, "final", check_code,
+                     status, json.dumps(details or {}, sort_keys=True), actor_id, created_at),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ConflictError("QA result identity conflict") from exc
+            return connection.execute("SELECT * FROM qa_results WHERE id=?", (qa_id,)).fetchone()
+
     def decide_in_transaction(self, connection, *, decision_id: str,
                               project_id: str, revision_id: str, stage: str,
                               subject_sha256: str, status: str, actor_id: str,
@@ -79,7 +112,8 @@ class ApprovalService:
                 AND asset_id=? AND stage IN ('technical',?)""",
                 (project_id, revision_id, asset["id"], stage),
             ).fetchall()
-            if not results or any(row["status"] != "pass" for row in results):
+            if (status == "approved"
+                    and (not results or any(row["status"] != "pass" for row in results))):
                 raise ValidationError("positive QA evidence is required")
             if (stage == "final" and status == "approved"
                     and not FINAL_QA_CODES.issubset(
