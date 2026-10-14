@@ -7,7 +7,7 @@ from db.content_repository import ContentRepository
 from db.migrate import run_migrations
 from domain.errors import ConflictError, ValidationError
 from domain.job_service import JobService
-from workers.contracts import WorkerReport
+from workers.contracts import WorkerReport, canonical_manifest_hash
 from workers.report_service import ArtifactVerifier, WorkerReportService
 
 NOW = "2026-10-13T12:00:00+00:00"
@@ -28,11 +28,14 @@ class WorkerContractTests(unittest.TestCase):
         self.output_hash = hashlib.sha256(self.data).hexdigest()
         self._seed_project()
         jobs = JobService(self.repo)
+        payload = {"input_sha256": HASH, "output_path": "renders/preview.mp4",
+                   "render_profile": "preview-v1", "asset_role": "preview",
+                   "mime_type": "video/mp4", "duration_ms": 1200,
+                   "width": 1080, "height": 1920}
+        payload["input_sha256"] = canonical_manifest_hash(payload)
+        self.input_hash = payload["input_sha256"]
         jobs.enqueue("job", "cmd", "screen_demo", "pilot", "project", "revision",
-                     {"input_sha256": HASH, "output_path": "renders/preview.mp4",
-                      "render_profile": "preview-v1", "asset_role": "preview",
-                      "mime_type": "video/mp4", "duration_ms": 1200,
-                      "width": 1080, "height": 1920}, NOW, NOW)
+                     payload, NOW, NOW)
         self.claim = jobs.claim_next("worker", NOW, LATER)
         self.verifier = ArtifactVerifier(
             self.root, lambda _path: {"mime_type": "video/mp4", "duration_ms": 1200,
@@ -46,7 +49,7 @@ class WorkerContractTests(unittest.TestCase):
     def report(self, **overrides):
         values = dict(report_id="report", job_id="job", worker_id="worker",
                       fence_token=self.claim.fence_token, schema_version="1.0.0",
-                      status="succeeded", input_sha256=HASH,
+                      status="succeeded", input_sha256=self.input_hash,
                       output_path="renders/preview.mp4", output_sha256=self.output_hash,
                       duration_ms=1200, render_profile="preview-v1",
                       machine_qa={"ok": True}, error_code=None, created_at=NOW)
@@ -63,6 +66,10 @@ class WorkerContractTests(unittest.TestCase):
                          ("pending", "pending"))
         self.assertEqual(asset["storage_key"], f".accepted/{self.output_hash}")
         self.assertEqual((self.root / asset["storage_key"]).read_bytes(), self.data)
+        checks = {row["check_code"] for row in self.repo.fetchall(
+            "SELECT check_code FROM qa_results WHERE asset_id='report:asset'"
+        )}
+        self.assertEqual(checks, {"duration_in_profile", "media_readable", "profile_matches"})
 
     def test_rejects_stale_fence_owner_expiry_or_wrong_input(self):
         for changes in ({"fence_token": 2}, {"worker_id": "other"},
@@ -129,6 +136,9 @@ class WorkerContractTests(unittest.TestCase):
                 VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
                 ("revision", "project", "brief", 1, "s", "c", "[]", "{}", HASH,
                  "owner", NOW),
+            )
+            connection.execute(
+                "UPDATE content_projects SET current_revision_id='revision',status='production_ready' WHERE id='project'"
             )
 
 

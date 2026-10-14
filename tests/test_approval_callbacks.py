@@ -14,6 +14,13 @@ NOW = "2026-10-13T12:00:00+00:00"
 LATER = "2026-10-13T12:05:00+00:00"
 EARLIER = "2026-10-13T11:00:00+00:00"
 HASH = "a" * 64
+QA_CODES = (
+    "source_traceable", "rights_allowed", "privacy_clear",
+    "claims_supported_or_labeled", "script_approved", "duration_in_profile",
+    "media_readable", "profile_matches", "subtitles_match_voice",
+    "text_legible_safe_zones", "audio_clear", "cta_single_and_working",
+    "no_critical_artifacts", "package_hash_verified",
+)
 
 
 class ApprovalCallbackTests(unittest.TestCase):
@@ -124,6 +131,21 @@ class ApprovalCallbackTests(unittest.TestCase):
         )
         self.assertEqual(row["status"], "approved")
 
+        with sqlite3.connect(self.path) as c:
+            c.execute(
+                "INSERT INTO assets(id,project_id,revision_id,role,storage_key,sha256,mime_type,size_bytes,rights_status,privacy_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                ("preview-c", "project", "revision", "preview", "preview-c.mp4",
+                 "f" * 64, "video/mp4", 1, "pending", "pending",
+                 "2026-10-13T12:01:00+00:00"),
+            )
+        rejected = self.approvals.decide(
+            decision_id="preview-rejected-without-positive-qa", project_id="project",
+            revision_id="revision", stage="preview", subject_sha256="f" * 64,
+            status="rejected", actor_id="u", actor_role="reviewer",
+            checklist_version="1", created_at=NOW,
+        )
+        self.assertEqual(rejected["status"], "rejected")
+
     def test_callback_deduplicates_update_and_blocks_replay_scope_and_expiry(self):
         token = self.callbacks.issue(user_id="u", chat_id="c", action="script:approve", subject_id="revision", row_version=1, subject_sha256=HASH, expires_at=LATER, created_at=NOW)
         first = self.callbacks.consume(producer="telegram", event_id="e1", token=token, user_id="u", chat_id="c", subject_sha256=HASH, row_version=1, now=NOW)
@@ -204,6 +226,74 @@ class ApprovalCallbackTests(unittest.TestCase):
             correlation_id="corr",
         )
         self.assertEqual(result, "approval:bound")
+
+    def test_callback_rejects_when_current_project_version_changed_after_issue(self):
+        token = self.callbacks.issue(
+            user_id="u", chat_id="c", action="script:approve", subject_id="revision",
+            row_version=1, subject_sha256=HASH, expires_at=LATER, created_at=NOW,
+        )
+        with sqlite3.connect(self.path) as c:
+            c.execute("UPDATE content_projects SET row_version=row_version+1 WHERE id='project'")
+        with self.assertRaises(ConflictError):
+            self.callbacks.consume(
+                producer="telegram", event_id="stale-version", token=token,
+                user_id="u", chat_id="c", subject_sha256=HASH,
+                row_version=1, now=NOW,
+            )
+
+    def test_final_approval_requires_complete_named_qa_rubric(self):
+        with sqlite3.connect(self.path) as c:
+            c.execute(
+                "INSERT INTO assets(id,project_id,revision_id,role,storage_key,sha256,mime_type,size_bytes,rights_status,privacy_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                ("master-rubric", "project", "revision", "master", "master.mp4",
+                 "d"*64, "video/mp4", 1, "allowed", "clear", NOW),
+            )
+            c.execute(
+                "INSERT INTO qa_results(id,project_id,revision_id,asset_id,stage,check_code,status,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                ("qa-one", "project", "revision", "master-rubric", "technical",
+                 "media_readable", "pass", "worker", NOW),
+            )
+        with self.assertRaises(ValidationError):
+            self.approvals.decide(
+                decision_id="final-incomplete", project_id="project", revision_id="revision",
+                stage="final", subject_sha256="d"*64, status="approved",
+                actor_id="u", actor_role="reviewer", checklist_version="1",
+                created_at=NOW,
+            )
+        with sqlite3.connect(self.path) as c:
+            for index, code in enumerate(QA_CODES):
+                c.execute(
+                    "INSERT INTO qa_results(id,project_id,revision_id,asset_id,stage,check_code,status,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (f"qa-full-{index}", "project", "revision", "master-rubric", "final",
+                     code, "pass", "reviewer", NOW),
+                )
+        row = self.approvals.decide(
+            decision_id="final-complete", project_id="project", revision_id="revision",
+            stage="final", subject_sha256="d"*64, status="approved",
+            actor_id="u", actor_role="reviewer", checklist_version="1",
+            created_at=NOW,
+        )
+        self.assertEqual(row["status"], "approved")
+
+    def test_human_qa_api_binds_current_revision_and_exact_asset(self):
+        with sqlite3.connect(self.path) as c:
+            c.execute(
+                "INSERT INTO assets(id,project_id,revision_id,role,storage_key,sha256,mime_type,size_bytes,rights_status,privacy_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                ("qa-asset", "project", "revision", "master", "qa.mp4", "d"*64,
+                 "video/mp4", 1, "allowed", "clear", NOW),
+            )
+        row = self.approvals.record_qa(
+            qa_id="human-qa", project_id="project", revision_id="revision",
+            asset_id="qa-asset", check_code="audio_clear", status="pass",
+            actor_id="u", actor_role="reviewer", created_at=NOW,
+        )
+        self.assertEqual(row["check_code"], "audio_clear")
+        with self.assertRaises(ValidationError):
+            self.approvals.record_qa(
+                qa_id="bad-qa", project_id="project", revision_id="revision",
+                asset_id="qa-asset", check_code="invented", status="pass",
+                actor_id="u", actor_role="reviewer", created_at=NOW,
+            )
 
 
 if __name__ == "__main__":

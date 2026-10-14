@@ -22,7 +22,7 @@ class UpgradeSixToTenTests(unittest.TestCase):
                     "INSERT INTO posts(topic,post_type,content_telegram,content_vk) VALUES(?,?,?,?)",
                     ("preserved", "case", "tg", "vk"),
                 )
-            self.assertEqual(run_migrations(database), list(range(7, 12)))
+            self.assertEqual(run_migrations(database), list(range(7, 13)))
             with sqlite3.connect(database) as connection:
                 self.assertEqual(connection.execute(
                     "SELECT topic FROM posts"
@@ -37,7 +37,7 @@ class UpgradeSixToTenTests(unittest.TestCase):
                 self.assertIn("immutable_publish_packages_update", triggers)
                 self.assertEqual(connection.execute(
                     "SELECT version FROM schema_migrations ORDER BY version"
-                ).fetchall(), [(number,) for number in range(1, 12)])
+                ).fetchall(), [(number,) for number in range(1, 13)])
 
 
 if __name__ == "__main__":

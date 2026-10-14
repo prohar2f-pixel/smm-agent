@@ -24,7 +24,7 @@ class ProductionSchemaTests(unittest.TestCase):
         return connection
 
     def test_migration_chain_reaches_version_seven(self):
-        self.assertEqual(run_migrations(self.path), list(range(1, 12)))
+        self.assertEqual(run_migrations(self.path), list(range(1, 13)))
 
     def test_production_tables_exist(self):
         run_migrations(self.path)
@@ -113,6 +113,8 @@ class ProductionSchemaTests(unittest.TestCase):
             )
             with self.assertRaises(sqlite3.IntegrityError):
                 connection.execute("UPDATE content_revisions SET script_text='changed' WHERE id='revision'")
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute("UPDATE content_briefs SET goal='changed' WHERE id='brief'")
             with self.assertRaises(sqlite3.IntegrityError):
                 connection.execute("UPDATE approval_decisions SET status='rejected' WHERE id='approval'")
             with self.assertRaises(sqlite3.IntegrityError):

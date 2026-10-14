@@ -151,10 +151,11 @@ class JobService:
                 raise ConflictError("stale job lease")
             if row["external_intent_at"] is not None:
                 raise JobStateError("job after external intent requires reconciliation")
+            next_status = "failed" if row["attempt_count"] >= row["max_attempts"] else "queued"
             connection.execute(
-                """UPDATE jobs SET status='queued',available_at=?,lease_owner=NULL,
+                """UPDATE jobs SET status=?,available_at=?,lease_owner=NULL,
                 lease_until=NULL,error_code=?,updated_at=?,row_version=row_version+1 WHERE id=?""",
-                (available_at, error_code, at, job_id),
+                (next_status, available_at, error_code, at, job_id),
             )
         return self.get(job_id)
 

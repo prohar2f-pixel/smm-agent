@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
+import stat
+from pathlib import Path
 
 from db.content_repository import ContentRepository
 from domain.errors import ConflictError, NotFoundError, ValidationError
-from domain.artifact_integrity import verified_asset_path
 from domain.package_hash import canonical_package_hash
 from domain.time_utils import parse_instant
-from publishing.base import DefinitivePublishError, PublishRequest, PublisherAdapter, PublishResult
+from publishing.base import (DefinitivePublishError, PublishRequest, PublisherAdapter,
+                             PublishResult, VerifiedAssetHandle)
 
 
 class PublishService:
@@ -65,6 +68,7 @@ class PublishService:
             raise ValidationError("publishing feature is disabled")
         if self.artifact_root is None:
             raise ValidationError("publishing requires an artifact root")
+        handles: list[VerifiedAssetHandle] = []
         with self.repository.transaction() as connection:
             row = self._load_ready(connection, job_id, at)
             if row["status"] == "published":
@@ -74,19 +78,27 @@ class PublishService:
             if adapter.platform != row["platform"]:
                 raise ValidationError("publisher adapter does not match job platform")
             assets = connection.execute(
-                """SELECT a.storage_key,a.sha256 FROM assets a
-                JOIN json_each(?) item ON item.value=a.id""", (row["assets_json"],),
+                """SELECT a.id,a.storage_key,a.sha256,a.mime_type,a.size_bytes FROM assets a
+                JOIN json_each(?) item ON item.value=a.id ORDER BY CAST(item.key AS INTEGER)""",
+                (row["assets_json"],),
             ).fetchall()
-            for asset in assets:
-                verified_asset_path(self.artifact_root, asset["storage_key"], asset["sha256"])
+            try:
+                handles = [self._open_verified_asset(asset) for asset in assets]
+            except Exception:
+                for handle in handles:
+                    handle.close()
+                raise
             attempt_no = connection.execute(
                 "SELECT COUNT(*) FROM publish_attempts WHERE publish_job_id=?", (job_id,),
             ).fetchone()[0] + 1
             key = hashlib.sha256(f"publish:{job_id}:{attempt_no}".encode()).hexdigest()
-            request = PublishRequest(key, row["target_ref"], row["caption_text"], row["assets_json"])
+            request = PublishRequest(
+                key, row["target_ref"], row["caption_text"], row["assets_json"],
+                tuple(handles),
+            )
             operation_id = f"publish-op:{job_id}:{attempt_no}"
             request_hash = hashlib.sha256(
-                json.dumps(request.__dict__, sort_keys=True).encode()
+                json.dumps(request.evidence_payload(), sort_keys=True).encode()
             ).hexdigest()
             connection.execute(
                 """INSERT INTO external_operations(id,command_id,pilot_id,project_id,
@@ -112,13 +124,53 @@ class PublishService:
             )
         try:
             result = adapter.send(request)
+            result.validate()
         except DefinitivePublishError as exc:
             return self._settle(job_id, attempt_no, key, "failed", None,
                                 type(exc).__name__, at)
         except Exception as exc:
             return self._settle(job_id, attempt_no, key, "unknown_outcome", None,
                                 type(exc).__name__, at)
-        return self._settle(job_id, attempt_no, key, "sent", result, None, at)
+        else:
+            return self._settle(job_id, attempt_no, key, "sent", result, None, at)
+        finally:
+            for handle in handles:
+                handle.close()
+
+    def _open_verified_asset(self, asset) -> VerifiedAssetHandle:
+        root = Path(self.artifact_root).resolve()
+        relative = Path(asset["storage_key"])
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ConflictError("artifact path escapes root")
+        cursor = root
+        for part in relative.parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise ConflictError("artifact path contains a symlink")
+        try:
+            path = (root / relative).resolve(strict=True)
+            path.relative_to(root)
+            descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        except (FileNotFoundError, OSError, ValueError) as exc:
+            raise ConflictError("artifact is missing or unsafe") from exc
+        stream = os.fdopen(descriptor, "rb")
+        try:
+            metadata = os.fstat(stream.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ConflictError("artifact is not a regular file")
+            digest = hashlib.sha256()
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+            if digest.hexdigest() != asset["sha256"] or metadata.st_size != asset["size_bytes"]:
+                raise ConflictError("artifact hash or size mismatch")
+            stream.seek(0)
+            return VerifiedAssetHandle(
+                asset["id"], asset["sha256"], asset["mime_type"],
+                asset["size_bytes"], stream,
+            )
+        except Exception:
+            stream.close()
+            raise
 
     def reconcile(self, job_id: str, adapter: PublisherAdapter, at: str):
         with self.repository.transaction() as connection:
@@ -142,6 +194,7 @@ class PublishService:
         result = adapter.reconcile(key)
         if result is None:
             return self.get(job_id)
+        result.validate()
         with self.repository.transaction() as connection:
             current = connection.execute(
                 """SELECT pj.status,pa.operation_id,pa.status AS attempt_status
@@ -179,9 +232,27 @@ class PublishService:
                     raise ConflictError("external operation reconciliation lost state race")
         return self.get(job_id)
 
+    def confirm_reconciliation(self, job_id: str, external_id: str,
+                               evidence_ref: str, at: str):
+        result = PublishResult(external_id, evidence_ref)
+        try:
+            result.validate()
+        except ValueError as exc:
+            raise ValidationError(str(exc)) from exc
+        with self.repository.transaction() as connection:
+            row = connection.execute(
+                """SELECT pa.attempt_no,pa.idempotency_key FROM publish_attempts pa
+                JOIN publish_jobs pj ON pj.id=pa.publish_job_id
+                WHERE pj.id=? AND pj.status='unknown_outcome'
+                AND pa.status='unknown_outcome' ORDER BY pa.attempt_no DESC LIMIT 1""",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise ConflictError("publish job is not awaiting reconciliation")
+        return self._settle(job_id, row["attempt_no"], row["idempotency_key"],
+                            "reconciled", result, None, at)
+
     def confirm_manual(self, job_id: str, external_id: str, evidence_ref: str, at: str):
-        if not self.publishing_enabled:
-            raise ValidationError("publishing feature is disabled")
         if self.artifact_root is None:
             raise ValidationError("publishing requires an artifact root")
         if not external_id or not evidence_ref:

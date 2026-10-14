@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +16,10 @@ from domain.job_service import JobService
 from domain.publish_service import PublishService
 from domain.text_factory import TextFactory
 from workers.runner import WorkerRunner
+from workers.report_service import ArtifactVerifier, WorkerReportService
+from workers.screen_demo import FfmpegScreenDemoRenderer, ScreenDemoJobHandler
+from workers.screen_demo import ScreenDemoPlanner
+from workers.contracts import canonical_manifest_hash
 
 
 def _enabled(value: str | None) -> bool:
@@ -62,6 +68,11 @@ class FactoryRuntime:
         self.repository = ContentRepository(config.db_path)
 
     def startup(self) -> list[int]:
+        if self.config.artifact_root is not None:
+            root = self.config.artifact_root.resolve()
+            database = self.config.db_path.resolve()
+            if database == root or root in database.parents:
+                raise ValidationError("FACTORY_ARTIFACT_ROOT cannot contain DB_PATH")
         self.config.db_path.parent.mkdir(parents=True, exist_ok=True)
         applied = run_migrations(self.config.db_path)
         if (self.config.worker_enabled or self.config.publishing_enabled
@@ -91,3 +102,69 @@ class FactoryRuntime:
             raise ValidationError("enabled worker requires registered handlers")
         return WorkerRunner(JobService(self.repository), handlers,
                             enabled=self.config.worker_enabled)
+
+    def worker_handlers(self) -> dict:
+        if self.config.artifact_root is None:
+            return {}
+        self.config.artifact_root.mkdir(parents=True, exist_ok=True)
+        renderer = FfmpegScreenDemoRenderer(self.config.artifact_root)
+        verifier = ArtifactVerifier(self.config.artifact_root, renderer.probe)
+        reports = WorkerReportService(self.repository, verifier)
+        return {
+            "screen_demo": ScreenDemoJobHandler(
+                self.repository, self.config.artifact_root, renderer, reports,
+            ),
+        }
+
+    def enqueue_screen_demo(self, *, command_id: str, job_id: str, project_id: str,
+                            payload: dict, stage: str, created_at: str):
+        if not self.config.control_plane_enabled:
+            raise ValidationError("factory control plane is disabled")
+        project = self.repository.fetchone(
+            """SELECT pilot_id,current_revision_id,status FROM content_projects
+            WHERE id=?""", (project_id,),
+        )
+        if (project is None or not project["current_revision_id"]
+                or (self.config.pilot_id and project["pilot_id"] != self.config.pilot_id)
+                or project["status"] not in ("production_ready", "preview_review", "accepted")):
+            raise ValidationError("project is not eligible for screen-demo rendering")
+        source = dict(payload)
+        source["output_path"] = f"jobs/{job_id}/{stage}.mp4"
+        source.update({
+            "schema_version": "1.0.0", "job_id": job_id, "fence_token": 1,
+            "revision_id": project["current_revision_id"],
+            "input_sha256": "0" * 64,
+        })
+        if stage == "master":
+            approved_hash = source.get("approved_preview_sha256")
+            preview = self.repository.fetchone(
+                """SELECT a.sha256,ad.status FROM assets a JOIN approval_decisions ad
+                ON ad.project_id=a.project_id AND ad.revision_id=a.revision_id
+                AND ad.subject_sha256=a.sha256
+                WHERE a.project_id=? AND a.revision_id=? AND a.role='preview'
+                AND ad.stage='preview'
+                ORDER BY ad.created_at DESC,ad.id DESC LIMIT 1""",
+                (project_id, project["current_revision_id"]),
+            )
+            if (preview is None or preview["status"] != "approved"
+                    or preview["sha256"] != approved_hash):
+                raise ValidationError("master requires the exact approved preview asset")
+        manifest = ScreenDemoPlanner().plan(
+            source, stage=stage,
+            approved_preview_sha256=source.get("approved_preview_sha256"),
+        )
+        job_payload = dict(manifest.payload)
+        for transient in ("job_id", "fence_token"):
+            job_payload.pop(transient, None)
+        job_payload.update({
+            "output_path": manifest.output_path,
+            "render_profile": manifest.render_profile,
+            "asset_role": "preview" if stage == "preview" else "master",
+            "mime_type": "video/mp4",
+            "duration_ms": round(float(source["duration_sec"]) * 1000),
+        })
+        job_payload["input_sha256"] = canonical_manifest_hash(job_payload)
+        return JobService(self.repository).enqueue(
+            job_id, command_id, "screen_demo", project["pilot_id"], project_id,
+            project["current_revision_id"], job_payload, created_at, created_at,
+        )

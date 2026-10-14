@@ -5,9 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from datetime import timedelta
+from statistics import median
 
 from db.content_repository import ContentRepository
 from domain.errors import NotFoundError
+from domain.package_hash import canonical_package_hash
+from domain.time_utils import parse_instant
 
 
 @dataclass(frozen=True)
@@ -19,6 +23,15 @@ class PilotReport:
 
 class PilotReportBuilder:
     WINDOWS = ("24h", "72h", "7d")
+    WINDOW_DELTA = {"24h": timedelta(hours=24), "72h": timedelta(hours=72),
+                    "7d": timedelta(days=7)}
+    REQUIRED_QA = {
+        "source_traceable", "rights_allowed", "privacy_clear",
+        "claims_supported_or_labeled", "script_approved", "duration_in_profile",
+        "media_readable", "profile_matches", "subtitles_match_voice",
+        "text_legible_safe_zones", "audio_clear", "cta_single_and_working",
+        "no_critical_artifacts", "package_hash_verified",
+    }
 
     def __init__(self, repository: ContentRepository):
         self.repository = repository
@@ -63,8 +76,17 @@ class PilotReportBuilder:
                 amount = round(entry["active_sec"] * entry["rate_minor_per_hour"] / 3600)
                 labor_costs[entry["currency"]] = labor_costs.get(entry["currency"], 0) + amount
         published = [row for row in jobs if row["status"] == "published"]
-        measured = {(row["publish_job_id"], row["window"], row["metric_name"])
-                    for row in snapshots if row["is_measured"]}
+        published_by_id = {row["id"]: row for row in published}
+        measured = set()
+        for snapshot in snapshots:
+            job = published_by_id.get(snapshot["publish_job_id"])
+            if not job or not snapshot["is_measured"] or snapshot["window"] not in self.WINDOW_DELTA:
+                continue
+            captured = parse_instant(snapshot["captured_at"], "captured_at")
+            published_at = parse_instant(job["updated_at"], "published_at")
+            if captured >= published_at + self.WINDOW_DELTA[snapshot["window"]]:
+                measured.add((snapshot["publish_job_id"], snapshot["window"],
+                              snapshot["metric_name"]))
         missing = [f"{job['id']}:{window}:{metric}" for job in published
                    for window in self.WINDOWS for metric in required_metrics
                    if (job["id"], window, metric) not in measured]
@@ -88,13 +110,130 @@ class PilotReportBuilder:
         for cost in cost_rows:
             signed = -cost["amount_minor"] if cost["kind"] == "refund" else cost["amount_minor"]
             provider_costs[cost["currency"]] = provider_costs.get(cost["currency"], 0) + signed
+        accepted_packages = []
+        for package_id in sorted({row["package_id"] for row in published}):
+            package = self.repository.fetchone(
+                """SELECT id,project_id,revision_id,package_sha256,caption_text,assets_json
+                FROM publish_packages WHERE id=?""",
+                (package_id,),
+            )
+            if package["package_sha256"] != canonical_package_hash(
+                    package["caption_text"], package["assets_json"]):
+                continue
+            try:
+                asset_ids = json.loads(package["assets_json"])
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(asset_ids, list) or not asset_ids:
+                continue
+            placeholders = ",".join("?" for _ in asset_ids)
+            masters = self.repository.fetchall(
+                f"""SELECT id,sha256,duration_ms FROM assets WHERE id IN ({placeholders})
+                AND project_id=? AND revision_id=? AND role='master'
+                AND duration_ms BETWEEN 30000 AND 45000""",
+                (*asset_ids, package["project_id"], package["revision_id"]),
+            )
+            final = self.repository.fetchone(
+                """SELECT status,subject_sha256 FROM approval_decisions
+                WHERE project_id=? AND revision_id=? AND stage='final'
+                ORDER BY created_at DESC,id DESC LIMIT 1""",
+                (package["project_id"], package["revision_id"]),
+            )
+            approved_master = next(
+                (asset for asset in masters if final and final["status"] == "approved"
+                 and asset["sha256"] == final["subject_sha256"]), None,
+            )
+            if approved_master is None:
+                continue
+            qa = self.repository.fetchall(
+                """SELECT check_code,status FROM qa_results WHERE project_id=?
+                AND revision_id=? AND asset_id=?""",
+                (package["project_id"], package["revision_id"], approved_master["id"]),
+            )
+            passed_codes = {row["check_code"] for row in qa if row["status"] == "pass"}
+            failed_codes = {row["check_code"] for row in qa if row["status"] == "fail"}
+            if (self.REQUIRED_QA.issubset(passed_codes)
+                    and not self.REQUIRED_QA.intersection(failed_codes)):
+                accepted_packages.append({**dict(package),
+                                          "master_id": approved_master["id"],
+                                          "master_sha256": approved_master["sha256"]})
+        accepted_by_project = {}
+        for package in accepted_packages:
+            accepted_by_project.setdefault(package["project_id"], package)
+        accepted_units = list(accepted_by_project.values())
+        source_ids = set()
+        for package in accepted_units:
+            rows = self.repository.fetchall(
+                "SELECT source_id FROM content_project_sources WHERE project_id=?",
+                (package["project_id"],),
+            )
+            source_ids.update(row["source_id"] for row in rows)
+        project_times = {}
+        for entry in times:
+            if entry["project_id"]:
+                project_times[entry["project_id"]] = (
+                    project_times.get(entry["project_id"], 0) + entry["active_sec"]
+                )
+        pilot_samples = [project_times[package["project_id"]]
+                         for package in accepted_units
+                         if package["project_id"] in project_times]
+        baselines = self.repository.fetchall(
+            """SELECT duration_sec FROM baselines WHERE pilot_id=?
+            AND comparable_format='screen_demo' AND duration_sec IS NOT NULL
+            AND duration_sec>0 ORDER BY created_at,id""", (pilot_id,),
+        )
+        median_pilot = median(pilot_samples) if pilot_samples else None
+        median_baseline = median([row["duration_sec"] for row in baselines]) if baselines else None
         reduction = None
-        if baseline and baseline["duration_sec"]:
-            reduction = 1 - active / baseline["duration_sec"]
+        if median_baseline and median_pilot is not None:
+            reduction = 1 - median_pilot / median_baseline
+        qa_complete = (len(accepted_units) >= pilot["target_count"]
+                       and len({package["master_sha256"] for package in accepted_units})
+                       >= pilot["target_count"])
+        distinct_sources = len(source_ids) >= pilot["target_count"]
+        cap_keys = ("max_manual_sec_per_package", "max_cycle_sec", "currency",
+                    "max_production_cost_minor", "min_quality_score")
+        caps_configured = all(key in thresholds for key in cap_keys)
+        cycles = []
+        for package in accepted_units:
+            project = self.repository.fetchone(
+                "SELECT created_at FROM content_projects WHERE id=?",
+                (package["project_id"],),
+            )
+            first_publish = self.repository.fetchone(
+                """SELECT MIN(pj.updated_at) AS published_at FROM publish_jobs pj
+                JOIN publish_packages pp ON pp.id=pj.package_id
+                WHERE pp.project_id=? AND pj.status='published'""",
+                (package["project_id"],),
+            )
+            if project and first_publish and first_publish["published_at"]:
+                cycles.append((parse_instant(first_publish["published_at"], "published_at")
+                               - parse_instant(project["created_at"], "created_at")).total_seconds())
+        cap_ok = False
+        if caps_configured:
+            currency = thresholds["currency"]
+            production_cost = labor_costs.get(currency, 0) + provider_costs.get(currency, 0)
+            baseline_quality = [row["quality_score"] for row in self.repository.fetchall(
+                """SELECT quality_score FROM baselines WHERE pilot_id=?
+                AND comparable_format='screen_demo' AND quality_score IS NOT NULL""",
+                (pilot_id,),
+            )]
+            cap_ok = (
+                all(sample <= thresholds["max_manual_sec_per_package"]
+                    for sample in pilot_samples)
+                and len(cycles) >= pilot["target_count"]
+                and all(0 <= cycle <= thresholds["max_cycle_sec"] for cycle in cycles)
+                and production_cost <= thresholds["max_production_cost_minor"]
+                and bool(baseline_quality)
+                and 1.0 >= thresholds["min_quality_score"]
+                and 1.0 >= median(baseline_quality)
+            )
         sufficient = (bool(times) and active > 0 and labor_known and bool(required_metrics)
-                      and len(published) >= pilot["target_count"] and not missing
-                      and not unknown and baseline is not None)
-        success = sufficient and reduction is not None and reduction >= 0.20
+                      and qa_complete and distinct_sources and not missing
+                      and not unknown and median_baseline is not None
+                      and len(pilot_samples) >= pilot["target_count"]
+                      and caps_configured)
+        success = (sufficient and cap_ok and reduction is not None and reduction >= 0.20)
         decision = "insufficient_data" if not sufficient else ("success" if success else "failure")
         metric_lines = [
             f"- {row['publish_job_id']} {row['window']} {row['metric_name']}: "
@@ -104,7 +243,8 @@ class PilotReportBuilder:
         lines = [
             f"# Отчёт пилота {pilot_id}", "", "## Производство", "",
             f"- Активное время: {active} сек.",
-            f"- Базовое время: {baseline['duration_sec'] if baseline else 'нет данных'} сек.",
+            f"- Медиана времени пилота: {median_pilot if median_pilot is not None else 'нет данных'} сек.",
+            f"- Медиана baseline: {median_baseline if median_baseline is not None else 'нет данных'} сек.",
             f"- Снижение времени: {round(reduction * 100, 2) if reduction is not None else 'нет данных'}%.",
             "- Трудозатраты: " + (
                 ", ".join(f"{amount} {currency} minor units"
@@ -118,7 +258,9 @@ class PilotReportBuilder:
             ) + ".",
             "", "## Метрики", "", *metric_lines, "",
             f"- Отсутствующие окна: {', '.join(missing) if missing else 'нет'}.",
-            f"- Опубликовано: {len(published)} из {pilot['target_count']}.",
+            f"- Опубликовано platform jobs: {len(published)}.",
+            f"- Принято независимых комплектов: {len(accepted_units)} из {pilot['target_count']}.",
+            f"- Разных исходников: {len(source_ids)} из {pilot['target_count']}.",
             f"- Неопределённые внешние операции: {'да' if unknown else 'нет'}.",
             "", "## Решение", "", f"**{decision}**", "",
         ]

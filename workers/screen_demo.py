@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import subprocess
+import tempfile
 
 from domain.errors import ValidationError
-from workers.contracts import SHA256, WorkerManifest, safe_relative_path
+from domain.qa_service import TechnicalQA
+from workers.contracts import (SHA256, WorkerManifest, WorkerReport,
+                               canonical_manifest_hash, safe_relative_path)
 
 
 class ScreenDemoPlanner:
@@ -21,6 +30,9 @@ class ScreenDemoPlanner:
             if not payload.get(key):
                 raise ValidationError(f"{key} is required")
             safe_relative_path(payload[key])
+            hash_key = key.replace("_path", "_sha256")
+            if not SHA256.fullmatch(str(payload.get(hash_key, ""))):
+                raise ValidationError(f"{hash_key} is required")
         clips = payload.get("clips")
         if not isinstance(clips, list) or not clips:
             raise ValidationError("at least one source clip is required")
@@ -30,6 +42,10 @@ class ScreenDemoPlanner:
                 raise ValidationError("every clip requires an exact sha256")
             if clip.get("end_sec", 0) <= clip.get("start_sec", 0):
                 raise ValidationError("clip end must follow start")
+        clip_duration = sum(float(clip["end_sec"]) - float(clip["start_sec"])
+                            for clip in clips)
+        if abs(clip_duration - float(duration)) > 0.05:
+            raise ValidationError("clip timeline must equal declared duration")
         if payload.get("width", 0) > 1920 or payload.get("height", 0) > 1920:
             raise ValidationError("frame dimensions exceed worker cap")
         if payload.get("fps", 0) not in range(1, 31):
@@ -50,3 +66,193 @@ class ScreenDemoPlanner:
         )
         manifest.validate()
         return manifest
+
+
+def _rooted(root: Path, relative: str, *, must_exist: bool) -> Path:
+    safe_relative_path(relative)
+    root = root.resolve()
+    candidate = root / relative
+    cursor = root
+    for part in Path(relative).parts:
+        cursor = cursor / part
+        if cursor.is_symlink():
+            raise ValidationError("media path contains a symlink")
+    try:
+        resolved = candidate.resolve(strict=must_exist)
+        resolved.relative_to(root)
+    except (FileNotFoundError, ValueError) as exc:
+        raise ValidationError("media path is missing or outside artifact root") from exc
+    return resolved
+
+
+class FfmpegScreenDemoRenderer:
+    """Local, network-free renderer using argument arrays and bounded runtime."""
+
+    def __init__(self, artifact_root: str | Path, *, timeout_sec: int = 300):
+        self.root = Path(artifact_root)
+        self.timeout_sec = timeout_sec
+
+    def validate_manifest_paths(self, manifest: WorkerManifest) -> None:
+        expected_prefix = PurePosixPath("jobs") / manifest.job_id
+        output = PurePosixPath(manifest.output_path)
+        if output.parent != expected_prefix or output.suffix != ".mp4":
+            raise ValidationError("render output must use its dedicated job namespace")
+        inputs = {manifest.payload["audio_path"], manifest.payload["subtitles_path"]}
+        inputs.update(clip["path"] for clip in manifest.payload["clips"])
+        if manifest.output_path in inputs or ".accepted" in output.parts:
+            raise ValidationError("render output cannot alias inputs or accepted evidence")
+
+    def render(self, manifest: WorkerManifest) -> dict:
+        self.validate_manifest_paths(manifest)
+        payload = manifest.payload
+        clip_paths = []
+        for clip in payload["clips"]:
+            clip_path = _rooted(self.root, clip["path"], must_exist=True)
+            if hashlib.sha256(clip_path.read_bytes()).hexdigest() != clip["sha256"]:
+                raise ValidationError("source clip hash mismatch")
+            clip_paths.append(clip_path)
+        audio_path = _rooted(self.root, payload["audio_path"], must_exist=True)
+        subtitles_path = _rooted(self.root, payload["subtitles_path"], must_exist=True)
+        for path, hash_key in ((audio_path, "audio_sha256"),
+                               (subtitles_path, "subtitles_sha256")):
+            if hashlib.sha256(path.read_bytes()).hexdigest() != payload[hash_key]:
+                raise ValidationError(f"{hash_key} mismatch")
+        root = self.root.resolve()
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        jobs = root / "jobs"
+        jobs.mkdir(mode=0o700, exist_ok=True)
+        jobs_fd = os.open(jobs, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            try:
+                os.mkdir(manifest.job_id, mode=0o700, dir_fd=jobs_fd)
+            except FileExistsError:
+                pass
+            job_fd = os.open(
+                manifest.job_id,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=jobs_fd,
+            )
+        finally:
+            os.close(jobs_fd)
+        output_name = PurePosixPath(manifest.output_path).name
+        descriptor, temporary_name = tempfile.mkstemp(
+            suffix=".mp4", dir=f"/proc/self/fd/{job_fd}",
+        )
+        temporary = Path(temporary_name)
+        subtitle_filter = str(subtitles_path).replace("'", "\\'").replace(":", "\\:")
+        inputs = []
+        filters = []
+        labels = []
+        scale = (f"scale={payload['width']}:{payload['height']}:"
+                 "force_original_aspect_ratio=decrease,"
+                 f"pad={payload['width']}:{payload['height']}:(ow-iw)/2:(oh-ih)/2")
+        for index, (clip, clip_path) in enumerate(zip(payload["clips"], clip_paths)):
+            inputs.extend(("-i", str(clip_path)))
+            label = f"v{index}"
+            labels.append(f"[{label}]")
+            filters.append(
+                f"[{index}:v]trim=start={clip['start_sec']}:end={clip['end_sec']},"
+                f"setpts=PTS-STARTPTS,{scale}[{label}]"
+            )
+        inputs.extend(("-i", str(audio_path)))
+        filters.append(
+            f"{''.join(labels)}concat=n={len(labels)}:v=1:a=0[concatv]"
+        )
+        filters.append(f"[concatv]subtitles='{subtitle_filter}'[outv]")
+        command = (
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            *inputs, "-t", str(payload["duration_sec"]),
+            "-filter_complex", ";".join(filters),
+            "-map", "[outv]", "-map", f"{len(clip_paths)}:a:0",
+            "-r", str(payload["fps"]), "-c:v", "libx264", "-preset", "medium",
+            "-pix_fmt", "yuv420p", "-c:a", "aac", "-movflags", "+faststart",
+            "-f", "mp4", f"/proc/self/fd/{descriptor}",
+        )
+        try:
+            subprocess.run(command, check=True, timeout=self.timeout_sec,
+                           stdin=subprocess.DEVNULL, capture_output=True,
+                           pass_fds=(descriptor,))
+            os.close(descriptor)
+            descriptor = None
+            os.replace(temporary.name, output_name, src_dir_fd=job_fd, dst_dir_fd=job_fd)
+            metadata = self.probe(Path(f"/proc/self/fd/{job_fd}/{output_name}"))
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+            temporary.unlink(missing_ok=True)
+            os.close(job_fd)
+        return metadata
+
+    def probe(self, path: Path) -> dict:
+        pass_fds = ()
+        parts = path.parts
+        if len(parts) > 4 and parts[:4] == ("/", "proc", "self", "fd"):
+            pass_fds = (int(parts[4]),)
+        command = (
+            "ffprobe", "-v", "error", "-show_streams", "-show_format",
+            "-of", "json", str(path),
+        )
+        completed = subprocess.run(command, check=True, timeout=30,
+                                   stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                   pass_fds=pass_fds)
+        data = json.loads(completed.stdout)
+        streams = data.get("streams", [])
+        video = next((item for item in streams if item.get("codec_type") == "video"), {})
+        duration = float(data.get("format", {}).get("duration") or video.get("duration") or 0)
+        return {
+            "mime_type": "video/mp4", "duration_ms": round(duration * 1000),
+            "width": int(video.get("width") or 0), "height": int(video.get("height") or 0),
+            "has_audio": any(item.get("codec_type") == "audio" for item in streams),
+            "has_subtitles": True,
+        }
+
+
+class ScreenDemoJobHandler:
+    def __init__(self, repository, artifact_root, renderer, report_service, *, now=None):
+        self.repository = repository
+        self.root = Path(artifact_root)
+        self.renderer = renderer
+        self.report_service = report_service
+        self.now = now or (lambda: datetime.now(timezone.utc).isoformat())
+        self.planner = ScreenDemoPlanner()
+
+    def __call__(self, claim):
+        row = self.repository.fetchone(
+            "SELECT payload_json,revision_id FROM jobs WHERE id=?", (claim.id,),
+        )
+        if row is None:
+            raise ValidationError("claimed render job disappeared")
+        payload = json.loads(row["payload_json"])
+        if canonical_manifest_hash(payload) != payload.get("input_sha256"):
+            raise ValidationError("stored render manifest hash mismatch")
+        payload.update({"job_id": claim.id, "fence_token": claim.fence_token,
+                        "revision_id": row["revision_id"]})
+        stage = payload.get("stage", "preview")
+        manifest = self.planner.plan(
+            payload, stage=stage,
+            approved_preview_sha256=payload.get("approved_preview_sha256"),
+        )
+        metadata = self.renderer.render(manifest)
+        output = _rooted(self.root, manifest.output_path, must_exist=True)
+        data = output.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        qa = TechnicalQA.inspect(
+            data, expected_sha256=digest,
+            duration_sec=metadata["duration_ms"] / 1000,
+            width=metadata["width"], height=metadata["height"],
+            has_audio=metadata["has_audio"], has_subtitles=metadata["has_subtitles"],
+        )
+        if not qa.passed:
+            raise ValidationError("technical QA failed: " + ",".join(qa.failures))
+        created_at = self.now()
+        report = WorkerReport(
+            report_id=f"{claim.id}:{claim.fence_token}", job_id=claim.id,
+            worker_id=claim.lease_owner, fence_token=claim.fence_token,
+            schema_version=manifest.schema_version, status="succeeded",
+            input_sha256=manifest.input_sha256, output_path=manifest.output_path,
+            output_sha256=digest, duration_ms=metadata["duration_ms"],
+            render_profile=manifest.render_profile,
+            machine_qa={"checks": ["checksum", "duration", "dimensions", "audio", "subtitles"]},
+            error_code=None, created_at=created_at,
+        )
+        return self.report_service.accept(report, created_at)

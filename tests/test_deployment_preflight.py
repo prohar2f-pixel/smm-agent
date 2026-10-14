@@ -48,7 +48,7 @@ class DeploymentPreflightTests(unittest.TestCase):
             self.assertIn("pilot is not active", errors)
             drill = backup_restore_drill(path, Path(directory))
             self.assertEqual(drill["integrity"], "ok")
-            self.assertEqual(drill["versions"], list(range(1,12)))
+            self.assertEqual(drill["versions"], list(range(1,13)))
 
 
 if __name__ == "__main__":
