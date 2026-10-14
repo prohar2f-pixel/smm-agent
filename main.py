@@ -27,7 +27,7 @@ async def main():
     runtime = FactoryRuntime(config)
     await asyncio.to_thread(runtime.startup)
     publish_service = runtime.publish_service()
-    worker_runner = runtime.worker_runner({})
+    worker_runner = runtime.worker_runner(runtime.worker_handlers())
     logger.info("База данных и production runtime инициализированы: %s", config.status())
 
     async def recover_worker_leases():
@@ -75,6 +75,9 @@ async def main():
             BotCommand(command="factory_queue", description="Очередь контент-завода"),
             BotCommand(command="factory_reconcile", description="Сверка неизвестного результата"),
             BotCommand(command="factory_report", description="Отчёт пилота"),
+            BotCommand(command="factory_enqueue", description="Поставить screen-demo в очередь"),
+            BotCommand(command="factory_approve", description="Точное решение по hash"),
+            BotCommand(command="factory_publish_enqueue", description="Подготовить publish job"),
         ])
     await bot.set_my_commands(commands)
 

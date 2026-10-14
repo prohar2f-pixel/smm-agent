@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +16,9 @@ from domain.job_service import JobService
 from domain.publish_service import PublishService
 from domain.text_factory import TextFactory
 from workers.runner import WorkerRunner
+from workers.report_service import ArtifactVerifier, WorkerReportService
+from workers.screen_demo import FfmpegScreenDemoRenderer, ScreenDemoJobHandler
+from workers.screen_demo import ScreenDemoPlanner
 
 
 def _enabled(value: str | None) -> bool:
@@ -91,3 +96,55 @@ class FactoryRuntime:
             raise ValidationError("enabled worker requires registered handlers")
         return WorkerRunner(JobService(self.repository), handlers,
                             enabled=self.config.worker_enabled)
+
+    def worker_handlers(self) -> dict:
+        if self.config.artifact_root is None:
+            return {}
+        self.config.artifact_root.mkdir(parents=True, exist_ok=True)
+        renderer = FfmpegScreenDemoRenderer(self.config.artifact_root)
+        verifier = ArtifactVerifier(self.config.artifact_root, renderer.probe)
+        reports = WorkerReportService(self.repository, verifier)
+        return {
+            "screen_demo": ScreenDemoJobHandler(
+                self.repository, self.config.artifact_root, renderer, reports,
+            ),
+        }
+
+    def enqueue_screen_demo(self, *, command_id: str, job_id: str, project_id: str,
+                            payload: dict, stage: str, created_at: str):
+        if not self.config.control_plane_enabled:
+            raise ValidationError("factory control plane is disabled")
+        project = self.repository.fetchone(
+            """SELECT pilot_id,current_revision_id,status FROM content_projects
+            WHERE id=?""", (project_id,),
+        )
+        if (project is None or not project["current_revision_id"]
+                or (self.config.pilot_id and project["pilot_id"] != self.config.pilot_id)
+                or project["status"] not in ("production_ready", "preview_review", "accepted")):
+            raise ValidationError("project is not eligible for screen-demo rendering")
+        source = dict(payload)
+        encoded = json.dumps(source, ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":")).encode()
+        source.update({
+            "schema_version": "1.0.0", "job_id": job_id, "fence_token": 1,
+            "revision_id": project["current_revision_id"],
+            "input_sha256": hashlib.sha256(encoded).hexdigest(),
+        })
+        manifest = ScreenDemoPlanner().plan(
+            source, stage=stage,
+            approved_preview_sha256=source.get("approved_preview_sha256"),
+        )
+        job_payload = dict(manifest.payload)
+        for transient in ("job_id", "fence_token"):
+            job_payload.pop(transient, None)
+        job_payload.update({
+            "output_path": manifest.output_path,
+            "render_profile": manifest.render_profile,
+            "asset_role": "preview" if stage == "preview" else "master",
+            "mime_type": "video/mp4",
+            "duration_ms": round(float(source["duration_sec"]) * 1000),
+        })
+        return JobService(self.repository).enqueue(
+            job_id, command_id, "screen_demo", project["pilot_id"], project_id,
+            project["current_revision_id"], job_payload, created_at, created_at,
+        )

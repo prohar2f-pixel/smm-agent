@@ -70,6 +70,7 @@ class CallbackService:
                     or row["subject_sha256"] != subject_sha256
                     or row["expected_row_version"] != row_version):
                 raise ValidationError("callback scope mismatch")
+            self._require_current_version(connection, row)
             result_ref = f"callback:{token}"
             connection.execute(
                 """INSERT INTO inbox_events(id,producer,event_id,payload_sha256,status,
@@ -114,6 +115,7 @@ class CallbackService:
                     or action["subject_sha256"] != subject_sha256
                     or action["expected_row_version"] != row_version):
                 raise ValidationError("callback scope mismatch")
+            self._require_current_version(connection, action)
             try:
                 expected_stage, verb = action["action"].split(":", 1)
             except ValueError as exc:
@@ -154,3 +156,13 @@ class CallbackService:
                 (now, result_ref, token),
             )
             return result_ref
+
+    @staticmethod
+    def _require_current_version(connection, action) -> None:
+        current = connection.execute(
+            """SELECT p.row_version FROM content_revisions r
+            JOIN content_projects p ON p.id=r.project_id WHERE r.id=?""",
+            (action["subject_id"],),
+        ).fetchone()
+        if current is None or current["row_version"] != action["expected_row_version"]:
+            raise ConflictError("callback aggregate version is stale")

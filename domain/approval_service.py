@@ -15,6 +15,13 @@ ROLE_BY_STAGE = {
     "final": {"owner", "reviewer"}, "animatic": {"owner", "reviewer"},
     "publish": {"owner", "publisher"},
 }
+FINAL_QA_CODES = {
+    "source_traceable", "rights_allowed", "privacy_clear",
+    "claims_supported_or_labeled", "script_approved", "duration_in_profile",
+    "media_readable", "profile_matches", "subtitles_match_voice",
+    "text_legible_safe_zones", "audio_clear", "cta_single_and_working",
+    "no_critical_artifacts", "package_hash_verified",
+}
 
 
 class ApprovalService:
@@ -68,12 +75,16 @@ class ApprovalService:
                 raise ValidationError("approval stage has no rendered asset")
             expected = asset["sha256"]
             results = connection.execute(
-                """SELECT status FROM qa_results WHERE project_id=? AND revision_id=?
+                """SELECT check_code,status FROM qa_results WHERE project_id=? AND revision_id=?
                 AND asset_id=? AND stage IN ('technical',?)""",
                 (project_id, revision_id, asset["id"], stage),
             ).fetchall()
             if not results or any(row["status"] != "pass" for row in results):
                 raise ValidationError("positive QA evidence is required")
+            if (stage == "final" and status == "approved"
+                    and not FINAL_QA_CODES.issubset(
+                        {row["check_code"] for row in results if row["status"] == "pass"})):
+                raise ValidationError("final approval requires the complete QA rubric")
         elif stage == "publish":
             if platform not in ("telegram", "vk", "manual") or not target_ref:
                 raise ValidationError("publish approval requires platform and target")

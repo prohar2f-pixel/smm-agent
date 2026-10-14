@@ -9,6 +9,8 @@ from db.migrate import run_migrations
 from domain.errors import ConflictError, ValidationError
 from domain.publish_service import PublishService
 from publishing.base import PublishResult
+from publishing.telegram_pub import TelegramPublisherAdapter
+from publishing.vk_pub import VkPublisherAdapter
 
 NOW = "2026-10-13T12:00:00+00:00"
 LATER = "2026-10-13T13:00:00+00:00"
@@ -27,6 +29,7 @@ class FakeAdapter:
 
     def send(self, request):
         self.requests.append(request)
+        self.asset_bytes = tuple(asset.read() for asset in request.assets)
         if self.outcome == "timeout":
             raise TimeoutError
         if self.outcome == "fail":
@@ -62,7 +65,7 @@ class PublishServiceTests(unittest.TestCase):
             c.execute("INSERT INTO content_briefs(id,project_id,brief_no,audience,goal,offer,angle,cta_text,platform,target_ref,duration_min_sec,duration_max_sec,constraints_json,prompt_version,content_sha256,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", ("brief","project",1,"a","g","o","x","cta","tg","target",30,45,"[]","1.0.0","b"*64,"owner",NOW))
             c.execute("INSERT INTO content_revisions(id,project_id,brief_id,revision_no,script_text,caption_text,timeline_json,prompt_versions_json,content_sha256,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", ("revision","project","brief",1,"s","c","[]","{}","c"*64,"owner",NOW))
             c.execute("UPDATE content_projects SET current_revision_id='revision' WHERE id='project'")
-            c.execute("INSERT INTO assets(id,project_id,revision_id,role,storage_key,sha256,mime_type,size_bytes,rights_status,privacy_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", ("master","project","revision","master","master.mp4",MASTER_HASH,"video/mp4",1,"allowed","clear",NOW))
+            c.execute("INSERT INTO assets(id,project_id,revision_id,role,storage_key,sha256,mime_type,size_bytes,rights_status,privacy_status,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)", ("master","project","revision","master","master.mp4",MASTER_HASH,"video/mp4",len(MASTER_BYTES),"allowed","clear",NOW))
             c.execute("INSERT INTO qa_results(id,project_id,revision_id,asset_id,stage,check_code,status,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)", ("qa","project","revision","master","technical","media","pass","worker",NOW))
             c.execute("INSERT INTO approval_decisions(id,project_id,revision_id,stage,subject_sha256,status,actor_id,actor_role,checklist_version,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)", ("final","project","revision","final",MASTER_HASH,"approved","owner","owner","1",NOW))
             c.execute("INSERT INTO publish_packages(id,project_id,revision_id,package_sha256,caption_text,assets_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?)", ("pkg","project","revision",HASH,"caption",'["master"]',"owner",NOW))
@@ -187,6 +190,65 @@ class PublishServiceTests(unittest.TestCase):
         (self.artifacts / "master.mp4").write_bytes(b"tampered")
         with self.assertRaises(ConflictError):
             self.service.execute("tampered", FakeAdapter(), NOW)
+
+    def test_adapter_reads_verified_open_handle_not_replaced_path(self):
+        self.approve("target")
+        self.service.enqueue(
+            job_id="stable", package_id="pkg", platform="telegram",
+            target_ref="target", created_at=NOW,
+        )
+
+        path = self.artifacts / "master.mp4"
+
+        class ReplacingAdapter(FakeAdapter):
+            def send(adapter_self, request):
+                path.unlink()
+                path.write_bytes(b"replacement")
+                return super().send(request)
+
+        adapter = ReplacingAdapter()
+        result = self.service.execute("stable", adapter, NOW)
+        self.assertEqual(result["status"], "published")
+        self.assertEqual(adapter.asset_bytes, (MASTER_BYTES,))
+        self.assertTrue(all(asset.closed for asset in adapter.requests[0].assets))
+
+    def test_empty_provider_result_is_rejected_as_unknown(self):
+        self.approve("target")
+        self.service.enqueue(
+            job_id="empty-result", package_id="pkg", platform="telegram",
+            target_ref="target", created_at=NOW,
+        )
+
+        class EmptyResultAdapter(FakeAdapter):
+            def send(self, request):
+                return PublishResult("", "")
+
+        row = self.service.execute("empty-result", EmptyResultAdapter(), NOW)
+        self.assertEqual(row["status"], "unknown_outcome")
+
+    def test_telegram_and_vk_adapters_forward_verified_bytes_and_idempotency(self):
+        captured = []
+
+        def transport(**payload):
+            captured.append(payload)
+            return {"external_id": "42", "evidence_ref": "provider://42"}
+
+        self.approve("target")
+        self.service.enqueue(job_id="tg-real", package_id="pkg", platform="telegram",
+                             target_ref="target", created_at=NOW)
+        result = self.service.execute(
+            "tg-real", TelegramPublisherAdapter(transport), NOW,
+        )
+        self.assertEqual(result["status"], "published")
+        self.assertEqual(captured[0]["assets"][0]["bytes"], MASTER_BYTES)
+        self.assertEqual(len(captured[0]["idempotency_key"]), 64)
+
+        self.approve("vk-target", "vk")
+        self.service.enqueue(job_id="vk-real", package_id="pkg", platform="vk",
+                             target_ref="vk-target", created_at=NOW)
+        result = self.service.execute("vk-real", VkPublisherAdapter(transport), NOW)
+        self.assertEqual(result["status"], "published")
+        self.assertEqual(captured[1]["assets"][0]["sha256"], MASTER_HASH)
 
 
 if __name__ == "__main__":

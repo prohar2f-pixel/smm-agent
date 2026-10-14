@@ -21,4 +21,10 @@ class WorkerRunner:
                                             kinds=tuple(self.handlers))
         if claim is None:
             return None
-        return self.handlers[claim.kind](claim)
+        try:
+            return self.handlers[claim.kind](claim)
+        except Exception as exc:
+            return self.job_service.fail_retryable(
+                claim.id, worker_id, claim.fence_token,
+                type(exc).__name__.upper(), now, now,
+            )

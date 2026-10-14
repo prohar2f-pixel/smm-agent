@@ -6,7 +6,9 @@
   "input_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "duration_sec": 36,
   "audio_path": "inputs/voice.wav",
+  "audio_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
   "subtitles_path": "inputs/subtitles.srt",
+  "subtitles_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
   "clips": [
     {"path": "inputs/demo.mp4", "start_sec": 0, "end_sec": 36, "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
   ],

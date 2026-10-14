@@ -112,7 +112,7 @@ class R1SchemaTests(unittest.TestCase):
     def test_migration_chain_includes_current_version(self):
         applied = run_migrations(self.db_path)
 
-        self.assertEqual(applied, list(range(1, 12)))
+        self.assertEqual(applied, list(range(1, 13)))
 
     def test_foreign_keys_reject_missing_pilot_and_revision(self):
         run_migrations(self.db_path)
